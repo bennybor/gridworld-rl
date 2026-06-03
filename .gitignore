@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.json.bak
+
+# Secrets — never commit these
+.streamlit/secrets.toml
+.claude/settings.local.json
+
+# Generated output & logs
+*.log
+*.png
+test_output.txt
+
+# Editor config
+.vscode/

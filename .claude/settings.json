@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(.venv/Scripts/streamlit*)",
+      "Bash(.venv/Scripts/pip*)",
+      "Bash(.venv/Scripts/python*)",
+      "PowerShell(.venv\\Scripts\\streamlit*)",
+      "PowerShell(.venv\\Scripts\\pip*)",
+      "PowerShell(.venv\\Scripts\\python*)",
+      "PowerShell(Get-Process*)",
+      "PowerShell(Get-Content*)"
+    ]
+  }
+}
