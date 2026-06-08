@@ -9,7 +9,9 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
+import re
 import random
+import pathlib
 import urllib.request
 import urllib.error
 import json
@@ -166,16 +168,23 @@ def _init_claude_model_selector():
         st.session_state.setdefault("CLAUDE_MODEL", default)
 
 
-# Initialize selector early so it's available when helpers run
+# Ensure CLAUDE_MODEL is in session state before any helper runs
 if "CLAUDE_MODEL" not in st.session_state:
-    _init_claude_model_selector()
+    st.session_state["CLAUDE_MODEL"] = _get_claude_model_env() or "claude-opus-4-8"
+
+# ── Apply pending parameter changes (from "Try Again") before any widgets render ──
+# Streamlit forbids setting widget-bound keys after the widget has been drawn.
+# We store changes in _pending_param_changes and apply them here on the next rerun.
+_pending = st.session_state.pop("_pending_param_changes", {})
+for _ppk, _ppv in _pending.items():
+    st.session_state[_ppk] = _ppv
 CELLS = [
     ("Empty",    ".",  "#F1F5F9", "#CBD5E1", "",    "#334155"),
     ("Wall",     "#",  "#1E293B", "#0F172A", "■",   "#94A3B8"),
     ("Slippery", "~",  "#BAE6FD", "#7DD3FC", "≈",   "#0369A1"),
-    ("Goal",     "G",  "#BBF7D0", "#4ADE80", "G",   "#166534"),
-    ("Trap",     "X",  "#FECACA", "#F87171", "X",   "#991B1B"),
-    ("Start",    "S",  "#FEF08A", "#FACC15", "S",   "#713F12"),
+    ("Goal",     "G",  "#BBF7D0", "#4ADE80", "🏁",  "#166534"),
+    ("Trap",     "X",  "#FECACA", "#F87171", "✗",   "#991B1B"),
+    ("Start",    "S",  "#FEF08A", "#FACC15", "🚦",  "#713F12"),
 ]
 CELL_CHAR  = [c[1] for c in CELLS]
 CELL_FILL  = [c[2] for c in CELLS]
@@ -219,6 +228,37 @@ def _safe_rerun() -> None:
         return
 
 
+# Default values for all training / dynamics parameters (used by the Reset button)
+_TRAINING_DEFAULTS: dict = {
+    "algo": "Q-Learning",
+    "run_mode": "Full",
+    "episodes": 3000,
+    "alpha": 0.1,
+    "epsilon": 1.0,
+    "epsilon_decay": 0.998,
+    "exploring_starts": True,
+    "max_steps": 300,
+    "step_rew": 0.0,
+    "slip_prob": 0.3,
+    "gamma": 0.95,
+    "obs_n_neighbors": 0,
+    "obs_use_goal_dist": False,
+    "dqn_hidden_str": "64,64",
+    "dqn_lr": 1e-3,
+    "dqn_batch_size": 64,
+    "dqn_buffer_size": 10_000,
+    "dqn_target_update": 100,
+    "dqn_episodes": 3000,
+    "dqn_epsilon": 1.0,
+    "dqn_epsilon_decay": 0.997,
+    "dqn_epsilon_min": 0.01,
+    "use_curriculum": False,
+    "curriculum_method": "ADR",
+    "n_curriculum_setups": 100,
+    "curriculum_perf_threshold": 0.5,
+}
+
+
 def _grid_to_layout(grid, rows, cols):
     return ["".join(CELL_CHAR[grid[r][c]] for c in range(cols))
             for r in range(rows)]
@@ -226,6 +266,20 @@ def _grid_to_layout(grid, rows, cols):
 
 def _layout_to_grid(layout):
     return [[CHAR_TO_IDX[ch] for ch in row] for row in layout]
+
+
+def _reward_cell_colors(cr):
+    """Return (fillcolor, linecolor) for non-terminal cells carrying a reward.
+
+    Colour intensity scales smoothly with |cr|, saturating around 5.
+    """
+    v = float(cr)
+    t = min(1.0, abs(v) / 5.0)                 # 0 → faint, 1 → solid
+    alpha = round(0.18 + 0.55 * t, 2)
+    if v >= 0:
+        return f"rgba(74,222,128,{alpha})", "#16A34A"   # green-400
+    else:
+        return f"rgba(248,113,113,{alpha})", "#DC2626"  # red-400
 
 
 def _generate_random_layout(scale, rows, cols, hints=None):
@@ -321,7 +375,10 @@ def _generate_random_layout(scale, rows, cols, hints=None):
     cell_rewards[main_goal] = max(1, goal_value)
 
     # Traps
-    num_traps = 0 if scale <= 4 else min(5, (scale - 3) // 2)
+    if hints.get("no_traps"):
+        num_traps = 0
+    else:
+        num_traps = 0 if scale <= 4 else min(5, (scale - 3) // 2)
     trap_value = hints.get("trap_value")
     if trap_value is not None:
         try:
@@ -388,9 +445,9 @@ def _generate_random_layout(scale, rows, cols, hints=None):
         except Exception:
             neg_rewards = 0 if scale <= 2 else min(len(reward_spots) - pos_rewards, max(0, (scale - 2) // 2))
 
-    if pos_factor > 1.1:
+    if pos_factor > 1.1 and not hints.get("no_pos_rewards"):
         pos_rewards = min(len(reward_spots), pos_rewards + 1)
-    if neg_factor > 1.1:
+    if neg_factor > 1.1 and not hints.get("no_neg_rewards"):
         neg_rewards = min(len(reward_spots) - pos_rewards, neg_rewards + 1)
 
     for _ in range(pos_rewards):
@@ -659,7 +716,7 @@ def _build_claude_prompt(prompt_text, rows, cols, complexity):
     )
 
 
-def _call_claude(prompt_text):
+def _call_claude(prompt_text, max_tokens: int = 300):
     api_key = _get_claude_api_key()
     if not api_key:
         raise RuntimeError("Claude API key is not configured. Set CLAUDE_API_KEY or Streamlit secrets.")
@@ -685,7 +742,7 @@ def _call_claude(prompt_text):
                 ]
             }
         ],
-        "max_tokens": 300,
+        "max_tokens": max_tokens,
     }
 
     # Basic validation of API key and payload
@@ -865,6 +922,60 @@ def _infer_layout_directives_from_prompt(prompt_text, rows, cols):
     if wall_cols:
         hints["wall_cols"] = wall_cols
 
+    # Trap hints
+    _no_trap_phrases = (
+        "no trap", "no traps", "without trap", "without traps",
+        "do not place trap", "don't place trap", "dont place trap",
+        "remove trap", "avoid trap", "0 trap", "zero trap",
+    )
+    if any(p in normalized for p in _no_trap_phrases):
+        hints["no_traps"] = True
+
+    # Single / limited goal hints
+    _one_goal_phrases = (
+        "one goal", "only one goal", "single goal", "1 goal",
+        "one g ", "place only one", "just one goal", "only 1 goal",
+    )
+    if any(p in normalized for p in _one_goal_phrases):
+        hints["extra_goals"] = 0
+
+    # No positive cell-reward hints
+    _no_pos_phrases = (
+        "no positive reward", "no positive rewards",
+        "without positive reward", "without positive rewards",
+        "no cell reward", "no extra reward", "no bonus reward",
+        "remove positive reward", "0 positive", "zero positive",
+    )
+    if any(p in normalized for p in _no_pos_phrases):
+        hints["no_pos_rewards"] = True
+        hints["pos_reward_count"] = 0
+
+    # No negative cell-reward hints (non-trap cells)
+    _no_neg_phrases = (
+        "no negative reward", "no negative rewards",
+        "without negative reward", "without negative rewards",
+        "remove negative reward", "0 negative", "zero negative",
+    )
+    if any(p in normalized for p in _no_neg_phrases):
+        hints["no_neg_rewards"] = True
+        hints["neg_reward_count"] = 0
+
+    # Numeric goal reward — parse "reward of 100", "goal reward 100",
+    # "goal.*reward.*\d+", "reward.*\d+.*goal", etc.
+    _gr_match = (
+        re.search(r'goal\s+(?:reward|value)\s*(?:of\s*)?(\d+(?:\.\d+)?)', normalized)
+        or re.search(r'reward\s+of\s+(\d+(?:\.\d+)?)', normalized)
+        or re.search(r'reward\s*[=:]\s*(\d+(?:\.\d+)?)', normalized)
+        or re.search(r'(\d+(?:\.\d+)?)\s+(?:goal\s+)?reward', normalized)
+    )
+    if _gr_match:
+        try:
+            _gv = float(_gr_match.group(1))
+            if _gv > 0:
+                hints["goal_value"] = int(_gv) if _gv == int(_gv) else _gv
+        except (ValueError, IndexError):
+            pass
+
     return hints
 
 
@@ -1033,7 +1144,17 @@ def _load_training_payload(data):
 # ── Plotly helpers ────────────────────────────────────────────────────
 
 
-def make_editor_fig(grid, rows, cols, trace=None, current_step=None):
+def make_editor_fig(grid, rows, cols, trace=None, current_step=None, cell_rewards=None):
+    """Render the grid as a Plotly figure.
+
+    Parameters
+    ----------
+    cell_rewards : dict | None
+        Optional ``{(row, col): float}`` override.  When *None* the function
+        falls back to ``st.session_state["cell_rewards"]`` (the live editor
+        state).  Pass an explicit dict when rendering curriculum / saved layouts
+        that are not currently loaded in the editor.
+    """
     cell = _cell_px(rows, cols)
     fig = go.Figure()
 
@@ -1041,34 +1162,59 @@ def make_editor_fig(grid, rows, cols, trace=None, current_step=None):
         for c in range(cols):
             t  = grid[r][c]
             y0 = rows - 1 - r
+
+            # ── Resolve custom reward for this cell ───────────────────
+            if cell_rewards is not None:
+                cr = cell_rewards.get((r, c), None)
+            else:
+                try:
+                    cr = st.session_state.get("cell_rewards", {}).get((r, c), None)
+                except Exception:
+                    cr = None
+
+            # ── Cell background — tint non-terminal cells by reward ───
+            fill = CELL_FILL[t]
+            border = CELL_LINE[t]
+            if cr is not None and float(cr) != 0 and t in (E, SL):
+                fill, border = _reward_cell_colors(cr)
+
             fig.add_shape(
                 type="rect", layer="below",
                 x0=c+0.05, y0=y0+0.05, x1=c+0.95, y1=y0+0.95,
-                fillcolor=CELL_FILL[t],
-                line=dict(color=CELL_LINE[t], width=1.5),
+                fillcolor=fill,
+                line=dict(color=border, width=1.5),
             )
+
+            # ── Cell label ────────────────────────────────────────────
             lbl = CELL_LBL[t]
             if lbl:
+                # Emoji labels (Start 🚦 / Goal 🏁) must not be wrapped in
+                # HTML <b> tags — Plotly renders them as plain text.
+                is_emoji = any(ord(ch) > 127 for ch in lbl)
+                txt = lbl if is_emoji else f"<b>{lbl}</b>"
                 fig.add_annotation(
-                    x=c+0.5, y=y0+0.5, text=f"<b>{lbl}</b>",
+                    x=c+0.5, y=y0+0.5, text=txt,
                     showarrow=False,
                     font=dict(size=max(13, cell // 4), color=CELL_FG[t]),
                     xanchor="center", yanchor="middle",
                 )
-            # show custom reward if set for this cell
-            try:
-                cr = st.session_state.get("cell_rewards", {}).get((r, c), None)
-            except Exception:
-                cr = None
-            if cr is not None:
-                # colored badge in bottom-right of cell for custom reward
+
+            # ── Reward badge (bottom-right corner) ───────────────────
+            if cr is not None and float(cr) != 0:
                 badge_color = "#ECFDF5" if float(cr) >= 0 else "#FEF3F2"
                 badge_border = "#86EFAC" if float(cr) >= 0 else "#FCA5A5"
                 badge_fg = "#065F46" if float(cr) >= 0 else "#9B1C1C"
                 fig.add_annotation(
                     x=c+0.78, y=y0+0.22,
-                    text=f"<span style='background:{badge_color};border:1px solid {badge_border};padding:2px 6px;border-radius:8px;color:{badge_fg};font-weight:600'>{float(cr):+.2f}</span>",
-                    showarrow=False, font=dict(size=9), xanchor="center", yanchor="middle", opacity=0.95,
+                    text=(
+                        f"<span style='background:{badge_color};"
+                        f"border:1px solid {badge_border};"
+                        f"padding:2px 5px;border-radius:8px;"
+                        f"color:{badge_fg};font-weight:600'>"
+                        f"{float(cr):+.2f}</span>"
+                    ),
+                    showarrow=False, font=dict(size=9),
+                    xanchor="center", yanchor="middle", opacity=0.95,
                 )
 
     if trace is not None:
@@ -1144,9 +1290,17 @@ def make_replay_fig(env, trace):
     cell = _cell_px(rows, cols)
     fig = go.Figure()
 
+    # Use the episode's own grid if stored (curriculum may vary per episode)
+    _trace_grid_raw = trace.get("grid")
+    import numpy as _np_local
+    if _trace_grid_raw is not None:
+        _display_grid = _np_local.array(_trace_grid_raw, dtype=int)
+    else:
+        _display_grid = env.grid
+
     for r in range(rows):
         for c in range(cols):
-            t = int(env.grid[r, c])
+            t = int(_display_grid[r, c])
             y0 = rows - 1 - r
             fig.add_shape(
                 type="rect", layer="below",
@@ -1209,11 +1363,18 @@ def make_replay_fig(env, trace):
             ax=0, ay=20, font=dict(color="#b91c1c", size=11),
         )
 
-    total_reward = sum(rewards)
+    _gamma_r = getattr(env, "gamma", 0.99)
+    total_reward = sum((_gamma_r ** t) * r for t, r in enumerate(rewards))
+    _complexity = trace.get("complexity", 0.0)
+    _cx_tag = (
+        f" · <span style='color:#10B981'>complexity {_complexity:.1f}/10</span>"
+        if _complexity > 0 else ""
+    )
+    _title_text = f"Episode replay — return {total_reward:+.3f} (γ={_gamma_r}){_cx_tag}"
     fig.update_layout(
         width=cols * cell, height=rows * cell,
-        margin=dict(l=0, r=0, t=40, b=0),
-        title=dict(text=f"Replay Episode — reward {total_reward:+.2f}", x=0.5, xanchor="center"),
+        margin=dict(l=0, r=0, t=48, b=0),
+        title=dict(text=_title_text, x=0.5, xanchor="center", font=dict(size=13)),
         plot_bgcolor="#F8FAFC", paper_bgcolor="#F8FAFC",
         xaxis=dict(visible=False, range=[-0.1, cols + 0.1], fixedrange=True),
         yaxis=dict(visible=False, range=[-0.1, rows + 0.1], fixedrange=True),
@@ -1513,6 +1674,57 @@ def make_curves_fig(rewards, lengths, algo, off_policy_steps=None):
     return fig
 
 
+def make_complexity_fig(episode_complexities, algo):
+    """Rolling-average complexity curve (1–10 scale) over training episodes."""
+    n = len(episode_complexities)
+    if n == 0:
+        return None
+
+    w = max(1, min(50, n // 10))
+    xs = list(range(n))
+
+    def smooth(d):
+        return np.convolve(d, np.ones(w) / w, mode="valid").tolist()
+
+    xs_sm = list(range(w - 1, n))
+    raw_color  = "rgba(16,185,129,0.20)"
+    line_color = "#10B981"
+    fill_color = "rgba(16,185,129,0.08)"
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs, y=episode_complexities,
+        mode="lines", name="per episode",
+        line=dict(color=raw_color, width=1),
+        showlegend=False,
+    ))
+    if n >= w:
+        fig.add_trace(go.Scatter(
+            x=xs_sm, y=smooth(episode_complexities),
+            mode="lines", name=f"rolling avg (w={w})",
+            line=dict(color=line_color, width=2.5),
+            fill="tozeroy", fillcolor=fill_color,
+            showlegend=True,
+        ))
+
+    fig.update_xaxes(title_text="Episode", gridcolor="#F1F5F9", zeroline=False)
+    fig.update_yaxes(
+        title_text="Complexity (1–10)", gridcolor="#F1F5F9",
+        zeroline=False, range=[0, 10.5],
+    )
+    fig.update_layout(
+        height=280, margin=dict(l=40, r=20, t=45, b=40),
+        plot_bgcolor="#FAFBFF", paper_bgcolor="white",
+        font=dict(family="Inter, sans-serif", size=11, color="#374151"),
+        title=dict(
+            text=f"<b>{algo}</b> — Curriculum Complexity over Training",
+            x=0.5, font=dict(size=13, color="#0F172A"),
+        ),
+        legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.18),
+    )
+    return fig
+
+
 def make_timing_fig(episode_times, algo):
     """Visualize time per episode and cumulative training time."""
     n = len(episode_times)
@@ -1674,362 +1886,1308 @@ def make_epsilon_fig(epsilon_values, algo):
     return fig
 
 
+# ── Observation helpers ───────────────────────────────────────────────
+
+def _obs_dim(env, n_neighbors, use_goal_dist):
+    """Input vector length for DQN with the given observation settings.
+
+    n_neighbors=0, use_goal_dist=False → one-hot over n_states (legacy).
+    Otherwise → [row/rows, col/cols, <neighbor cell types>, [dx, dy]].
+    """
+    if n_neighbors == 0 and not use_goal_dist:
+        return env.n_states
+    n_cells = (2 * n_neighbors + 1) ** 2 - 1 if n_neighbors > 0 else 0
+    return 2 + n_cells + (2 if use_goal_dist else 0)
+
+
+def _build_obs(env, state, n_neighbors, use_goal_dist):
+    """Build the flat observation vector for DQN.
+
+    n_neighbors=0, use_goal_dist=False → one-hot (backwards-compatible).
+    Neighbor cells are ordered row-major around the agent, skipping (0,0).
+    Out-of-bounds cells are encoded as WALL (1/4 = 0.25).
+    Goal distance components: dx = (goal_col - col)/(cols-1),
+                               dy = (goal_row - row)/(rows-1).
+    """
+    if n_neighbors == 0 and not use_goal_dist:
+        v = [0.0] * env.n_states
+        v[state] = 1.0
+        return v
+
+    rows, cols = env.rows, env.cols
+    r, c = divmod(state, cols)
+    obs = [r / max(1, rows - 1), c / max(1, cols - 1)]
+
+    if n_neighbors > 0:
+        for dr in range(-n_neighbors, n_neighbors + 1):
+            for dc in range(-n_neighbors, n_neighbors + 1):
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    ct = int(env.grid[nr, nc])
+                else:
+                    ct = GridWorld.WALL
+                obs.append(ct / 4.0)
+
+    if use_goal_dist:
+        best_d = float("inf")
+        goal_r, goal_c = r, c
+        for gr in range(rows):
+            for gc in range(cols):
+                gs = gr * cols + gc
+                if env.is_terminal(gs) and int(env.grid[gr, gc]) == GridWorld.GOAL:
+                    d = abs(gr - r) + abs(gc - c)
+                    if d < best_d:
+                        best_d = d
+                        goal_r, goal_c = gr, gc
+        dx = (goal_c - c) / max(1, cols - 1)
+        dy = (goal_r - r) / max(1, rows - 1)
+        obs.extend([dx, dy])
+
+    return obs
+
+
+# ── Curriculum helpers ────────────────────────────────────────────────
+
+def _generate_curriculum_setups(n_setups, rows, cols,
+                                 step_reward=0.0, slip_prob=0.3, gamma=0.95,
+                                 hints=None,
+                                 min_complexity=1.0, max_complexity=10.0):
+    """Return a list of `n_setups` layout dicts spanning complexity min→max.
+
+    ``hints`` is the dict produced by :func:`_infer_layout_directives_from_prompt`
+    and is forwarded to every :func:`_generate_random_layout` call so that
+    constraints such as *no traps* or *one goal* are respected throughout the
+    entire curriculum.
+    """
+    hints = hints or {}
+    min_complexity = max(1.0, min(float(min_complexity), 10.0))
+    max_complexity = max(min_complexity, min(float(max_complexity), 10.0))
+    setups = []
+    for i in range(n_setups):
+        frac = i / max(1, n_setups - 1)
+        complexity = min_complexity + frac * (max_complexity - min_complexity)
+        grid, cell_rewards = _generate_random_layout(
+            max(1, round(complexity)), rows, cols, hints=hints
+        )
+        layout = _grid_to_layout(grid, rows, cols)
+        setups.append({
+            "index": i,
+            "complexity": round(complexity, 2),
+            "rows": rows,
+            "cols": cols,
+            "layout": layout,
+            "cell_rewards": {f"{r},{c}": float(v) for (r, c), v in cell_rewards.items()},
+            "step_reward": step_reward,
+            "slip_prob": slip_prob,
+            "gamma": gamma,
+        })
+    return setups
+
+
+def _bfs_goal_distances(env) -> list[float]:
+    """BFS from all goal cells outward.  Returns a list indexed by state id
+    where each value is the shortest-path distance to the nearest goal.
+    Walls are impassable; unreachable states get ``inf``.
+    """
+    from collections import deque
+    dist = [float("inf")] * env.n_states
+    q = deque()
+    for s in range(env.n_states):
+        r, c = divmod(s, env.cols)
+        if int(env.grid[r, c]) == env.GOAL:
+            dist[s] = 0.0
+            q.append(s)
+    while q:
+        s = q.popleft()
+        r, c = divmod(s, env.cols)
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < env.rows and 0 <= nc < env.cols:
+                ns = nr * env.cols + nc
+                if dist[ns] == float("inf") and int(env.grid[nr, nc]) != env.WALL:
+                    dist[ns] = dist[s] + 1.0
+                    q.append(ns)
+    return dist
+
+
+def _potential_shaping(s, ns, dist, gamma, alpha):
+    """Potential-based shaping bonus F(s,s') = γ·Φ(s') − Φ(s).
+
+    Φ(s) = −alpha · dist(s, goal)  →  closer = higher potential.
+    Returns 0 if either state is unreachable (dist = inf).
+    """
+    phi_s  = -alpha * dist[s]  if dist[s]  != float("inf") else 0.0
+    phi_ns = -alpha * dist[ns] if dist[ns] != float("inf") else 0.0
+    return gamma * phi_ns - phi_s
+
+
+def _setup_to_env(setup):
+    """Build a GridWorld from a curriculum setup dict."""
+    cr = {tuple(map(int, k.split(","))): float(v)
+          for k, v in setup.get("cell_rewards", {}).items()}
+    cfg = GridConfig(
+        rows=setup["rows"], cols=setup["cols"], layout=setup["layout"],
+        step_reward=float(setup.get("step_reward", 0.0)),
+        goal_reward=1.0, trap_reward=-1.0, cell_rewards=cr,
+        slippery_slip_prob=float(setup.get("slip_prob", 0.3)),
+        gamma=float(setup.get("gamma", 0.95)),
+    )
+    return GridWorld(cfg)
+
+
+def _run_dqn_test(q_net, test_setups, complexity_target, n_games, n_nb, use_gd, max_steps=300):
+    """Run the trained DQN greedily on test setups near *complexity_target*.
+
+    Returns
+    -------
+    dict with keys: win_rate, avg_reward, avg_steps, n_games, n_setups_used, per_game
+    """
+    # Find the setups closest to the requested complexity (window ±1.5, widen if too few)
+    window = 1.5
+    nearby = [s for s in test_setups if abs(s["complexity"] - complexity_target) <= window]
+    if not nearby:
+        nearby = sorted(test_setups, key=lambda s: abs(s["complexity"] - complexity_target))[:max(5, len(test_setups)//4)]
+
+    per_game = []
+    for _ in range(n_games):
+        setup = random.choice(nearby)
+        ep_env = _setup_to_env(setup)
+        s = ep_env.reset()
+        total_r = 0.0
+        steps = 0
+        won = False
+        for _ in range(max_steps):
+            obs = _build_obs(ep_env, s, n_nb, use_gd)
+            with torch.no_grad():
+                action = int(q_net(torch.tensor([obs], dtype=torch.float32)).argmax(dim=1).item())
+            s, r, done = ep_env.step(action)
+            total_r += r
+            steps += 1
+            if done:
+                sr, sc = divmod(s, ep_env.cols)
+                won = ep_env.grid[sr, sc] == ep_env.GOAL
+                break
+        per_game.append({
+            "reward": total_r,
+            "steps": steps,
+            "won": won,
+            "complexity": setup["complexity"],
+        })
+
+    wins = sum(1 for g in per_game if g["won"])
+    return {
+        "win_rate": wins / len(per_game) if per_game else 0.0,
+        "avg_reward": float(np.mean([g["reward"] for g in per_game])) if per_game else 0.0,
+        "avg_steps": float(np.mean([g["steps"] for g in per_game])) if per_game else 0.0,
+        "n_games": len(per_game),
+        "n_setups_used": len(nearby),
+        "per_game": per_game,
+    }
+
+
+def _auto_save_run(training_summary: dict, res: dict) -> str | None:
+    """Persist a training run (setup + key metrics) to the results/ folder.
+
+    Filename:  YYYY-MM-DD_HH-MM-SS_<Algo>_<R>x<C>.json
+    Returns the file path string on success, or None on failure.
+    """
+    try:
+        folder = pathlib.Path("results")
+        folder.mkdir(exist_ok=True)
+
+        ts_str  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        algo_fs = (training_summary.get("algo") or "unknown").replace(" ", "_")
+        rows    = training_summary.get("rows", 0)
+        cols    = training_summary.get("cols", 0)
+        fname   = f"{ts_str}_{algo_fs}_{rows}x{cols}.json"
+        fpath   = folder / fname
+
+        rews     = res.get("rewards") or []
+        ep_times = res.get("episode_times") or []
+
+        # Downsample rewards to ≤ 500 points for compact storage
+        stride   = max(1, len(rews) // 500)
+        curve    = [round(float(r), 4) for r in rews[::stride]]
+
+        payload = {
+            "saved_at":        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "filename":        fname,
+            "training_summary": {
+                k: v for k, v in training_summary.items() if k != "hp_rows"
+            },
+            "results": {
+                "episodes_run":          len(rews),
+                "avg_reward_last_100":   round(float(np.mean(rews[-100:])),  4) if rews else None,
+                "avg_reward_last_20":    round(float(np.mean(rews[-20:])),   4) if rews else None,
+                "avg_reward_first_100":  round(float(np.mean(rews[:100])),   4) if len(rews) >= 100 else None,
+                "avg_reward_mid_third":  round(float(np.mean(rews[len(rews)//3 : 2*len(rews)//3])), 4)
+                                         if len(rews) > 60 else None,
+                "peak_reward":           round(float(max(rews)),   4) if rews else None,
+                "final_reward":          round(float(rews[-1]),    4) if rews else None,
+                "total_training_time_s": round(float(sum(ep_times)), 2) if ep_times else None,
+                "rewards_curve_downsampled": curve,
+            },
+        }
+
+        with open(fpath, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+
+        return str(fpath)
+    except Exception:
+        return None
+
+
+# ─── Valid parameter keys the analysis can suggest ───────────────────────────
+_SUGGESTION_PARAM_TYPES: dict[str, type] = {
+    "alpha":            float,
+    "epsilon":          float,
+    "epsilon_decay":    float,
+    "gamma":            float,
+    "max_steps":        int,
+    "exploring_starts": bool,
+    "episodes":         int,
+    "step_rew":         float,
+    "slip_prob":        float,
+    "dqn_lr":           float,
+    "dqn_hidden_str":   str,
+    "dqn_batch_size":   int,
+    "dqn_buffer_size":  int,
+    "dqn_target_update":int,
+    "dqn_epsilon":      float,
+    "dqn_epsilon_decay":float,
+    "dqn_epsilon_min":  float,
+    "dqn_episodes":     int,
+    "obs_n_neighbors":  int,
+    "obs_use_goal_dist":bool,
+}
+
+
+def _call_claude_analysis(training_summary: dict, res: dict) -> dict:
+    """Ask Claude to diagnose a training run and return structured suggestions.
+
+    Returns a dict:
+        {"issues": [str, ...], "suggestions": [{"text", "explanation", "param", "value"}, ...]}
+    """
+    rews     = res.get("rewards") or []
+    ep_times = res.get("episode_times") or []
+    n_ep     = len(rews)
+    algo     = training_summary.get("algo", "unknown")
+    cc       = training_summary.get("cell_counts", {})
+
+    def _stat(lst, lo, hi):
+        seg = lst[lo:hi]
+        return round(float(np.mean(seg)), 3) if seg else None
+
+    first_avg = _stat(rews, 0,           min(100, n_ep))
+    mid_avg   = _stat(rews, n_ep // 3,   2 * n_ep // 3)
+    last_avg  = _stat(rews, max(0, n_ep - 100), n_ep)
+    last20    = _stat(rews, max(0, n_ep - 20),  n_ep)
+    peak      = round(float(max(rews)), 3) if rews else None
+
+    # Build algo-specific parameter block
+    if algo == "DQN":
+        algo_params = (
+            f"  lr={training_summary.get('dqn_lr')}  hidden={training_summary.get('dqn_hidden')}\n"
+            f"  batch={training_summary.get('dqn_batch')}  buffer={training_summary.get('dqn_buffer'):,}\n"
+            f"  epsilon: {training_summary.get('dqn_epsilon')} decay {training_summary.get('dqn_epsilon_decay')} "
+            f"min {training_summary.get('dqn_epsilon_min')}\n"
+            f"  obs: n_neighbors={training_summary.get('obs_n_neighbors')}  "
+            f"goal_dist={training_summary.get('obs_use_goal_dist')}  "
+            f"input_dim={training_summary.get('obs_input_dim')}\n"
+            f"  curriculum: {training_summary.get('curriculum_active')}  "
+            f"method={training_summary.get('curriculum_method')}  "
+            f"threshold={training_summary.get('curriculum_threshold')}"
+        )
+    elif algo in ("Q-Learning", "SARSA"):
+        algo_params = (
+            f"  alpha={training_summary.get('alpha')}  "
+            f"epsilon: {training_summary.get('epsilon')} decay {training_summary.get('epsilon_decay')} min 0.01"
+        )
+    else:
+        algo_params = "  (Policy Iteration — no hyperparameters)"
+
+    param_list = "\n".join(
+        f'  "{k}" ({t.__name__}): {desc}'
+        for k, t, desc in [
+            ("alpha",            float, "Q/SARSA learning rate (0.001–0.5)"),
+            ("epsilon_decay",    float, "Q/SARSA epsilon decay per episode (0.99–0.9999)"),
+            ("epsilon",          float, "Q/SARSA initial epsilon (0.5–1.0)"),
+            ("gamma",            float, "discount factor (0.8–0.999)"),
+            ("max_steps",        int,   "max steps per episode (50–2000)"),
+            ("exploring_starts", bool,  "randomise start state each episode"),
+            ("episodes",         int,   "Q/SARSA episodes (500–20000)"),
+            ("step_rew",         float, "step penalty, negative encourages efficiency (-1.0–0.0)"),
+            ("dqn_lr",           float, "DQN learning rate (0.00001–0.01)"),
+            ("dqn_hidden_str",   str,   'DQN hidden layers e.g. "128,64"'),
+            ("dqn_batch_size",   int,   "DQN mini-batch size (32–512)"),
+            ("dqn_buffer_size",  int,   "DQN replay buffer size (1000–200000)"),
+            ("dqn_target_update",int,   "DQN target-net update interval in steps (10–1000)"),
+            ("dqn_epsilon",      float, "DQN initial epsilon (0.5–1.0)"),
+            ("dqn_epsilon_decay",float, "DQN epsilon decay per episode (0.99–0.9999)"),
+            ("dqn_epsilon_min",  float, "DQN minimum epsilon (0.001–0.2)"),
+            ("dqn_episodes",     int,   "DQN episodes (500–20000)"),
+            ("obs_n_neighbors",  int,   "DQN observation neighbor radius 0=one-hot 1-3=local patch"),
+            ("obs_use_goal_dist",bool,  "DQN include goal dx/dy in observation"),
+        ]
+        if algo == "DQN" or k in ("alpha","epsilon_decay","epsilon","gamma","max_steps",
+                                   "exploring_starts","episodes","step_rew")
+    )
+
+    prompt = f"""You are an expert reinforcement learning engineer. Analyse the following training run and return ONLY a valid JSON object — no explanation, no markdown fences, no extra text.
+
+=== TRAINING SETUP ===
+Algorithm : {algo}
+Grid      : {training_summary.get('rows')}×{training_summary.get('cols')} ({training_summary.get('rows',0)*training_summary.get('cols',0)} states)
+Walls={cc.get('walls',0)}  Goals={cc.get('goals',0)}  Traps={cc.get('traps',0)}  Slippery={cc.get('slippery',0)}
+Step reward={training_summary.get('step_rew')}  Goal reward={training_summary.get('goal_rew')}  Trap reward={training_summary.get('trap_rew')}
+Gamma={training_summary.get('gamma')}  Slip prob={training_summary.get('slip_prob')}
+Max steps/ep={training_summary.get('max_steps')}  Exploring starts={training_summary.get('exploring_starts')}
+Algorithm params:
+{algo_params}
+
+=== RESULTS ===
+Episodes run   : {n_ep:,}
+Avg reward (first 100 ep) : {first_avg}
+Avg reward (middle third) : {mid_avg}
+Avg reward (last 100 ep)  : {last_avg}
+Avg reward (last 20 ep)   : {last20}
+Peak reward               : {peak}
+Total training time       : {round(sum(ep_times),1) if ep_times else 'unknown'} s
+
+=== OUTPUT FORMAT (strict) ===
+{{
+  "issues": ["<concise issue description>", ...],
+  "suggestions": [
+    {{
+      "text": "<short label ≤ 8 words>",
+      "explanation": "<one sentence why this helps>",
+      "param": "<exact key from list below>",
+      "value": <new value, correct type>
+    }},
+    ...
+  ]
+}}
+
+=== VALID PARAM KEYS ===
+Only use keys from this list (only suggest params applicable to {algo}):
+{param_list}
+
+Provide 2–5 specific, concrete, actionable suggestions based on the observed training behaviour. Think about: convergence speed, exploration/exploitation balance, catastrophic forgetting, reward shaping, and network capacity."""
+
+    raw = _call_claude(prompt, max_tokens=1200)
+
+    # Strip markdown fences if present
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        # Try to extract the first {...} block
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            result = json.loads(m.group())
+        else:
+            raise ValueError(f"Claude returned non-JSON output: {raw[:300]}")
+
+    # Coerce value types
+    for sug in result.get("suggestions", []):
+        p = sug.get("param")
+        v = sug.get("value")
+        if p in _SUGGESTION_PARAM_TYPES and v is not None:
+            try:
+                sug["value"] = _SUGGESTION_PARAM_TYPES[p](v)
+            except (TypeError, ValueError):
+                pass
+
+    return result
+
+
+def _call_claude_chat(
+    messages: list[dict],
+    system: str = "",
+    max_tokens: int = 800,
+) -> str:
+    """Send a multi-turn conversation to Claude and return the assistant reply text.
+
+    `messages` is a list of {"role": "user"|"assistant", "content": str} dicts.
+    `system` is an optional system-prompt string for context injection.
+    """
+    api_key = _get_claude_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "Claude API key is not configured. Set CLAUDE_API_KEY or Streamlit secrets."
+        )
+
+    url = "https://api.anthropic.com/v1/messages"
+    model = None
+    try:
+        model = st.session_state.get("CLAUDE_MODEL")
+    except Exception:
+        model = None
+    if not model:
+        model = _get_claude_model_env() or "claude-opus-4-8"
+
+    # Convert our message list to the API format
+    api_messages = [
+        {"role": m["role"], "content": [{"type": "text", "text": m["content"]}]}
+        for m in messages
+    ]
+
+    payload: dict = {
+        "model": model,
+        "messages": api_messages,
+        "max_tokens": max_tokens,
+    }
+    if system:
+        payload["system"] = system
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+    import requests as _req
+    resp = _req.post(url, json=payload, headers=headers, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["content"][0]["text"]
+
+
+def _render_training_summary_card(s: dict, res: dict | None) -> None:
+    """Render a complete, styled training-setup card in the current Streamlit column."""
+
+    def _section(title: str, rows_kv: list) -> str:
+        rows_html = "".join(
+            f'<tr>'
+            f'<td style="color:#64748b;padding:2px 10px 2px 0;white-space:nowrap;'
+            f'font-size:0.75rem;vertical-align:top">{k}</td>'
+            f'<td style="font-weight:600;color:#1e293b;font-size:0.75rem">{v}</td>'
+            f'</tr>'
+            for k, v in rows_kv
+        )
+        return (
+            f'<div style="margin-bottom:12px">'
+            f'<div style="font-size:0.63rem;font-weight:700;text-transform:uppercase;'
+            f'letter-spacing:0.08em;color:#6366f1;margin-bottom:3px">{title}</div>'
+            f'<table style="border-collapse:collapse;width:100%">{rows_html}</table>'
+            f'</div><div style="border-top:1px solid #f1f5f9;margin-bottom:10px"></div>'
+        )
+
+    algo  = s.get("algo", "—")
+    rows  = s.get("rows", 0)
+    cols  = s.get("cols", 0)
+    parts = []
+
+    # ── Algorithm ──────────────────────────────────────────────────────
+    parts.append(_section("🧠 Algorithm", [
+        ("Algorithm",        algo),
+        ("Mode",             s.get("run_mode", "Full")),
+        ("Episodes",         f"{s.get('total_ep', 0):,}"),
+        ("Max steps / ep",   str(s.get("max_steps", "—"))),
+        ("Exploring starts", "✓" if s.get("exploring_starts") else "✗"),
+    ]))
+
+    # ── Grid ───────────────────────────────────────────────────────────
+    cc = s.get("cell_counts", {})
+    parts.append(_section("📐 Grid", [
+        ("Size",           f"{rows} × {cols}  ({rows * cols} states)"),
+        ("Walls",          str(cc.get("walls",    "—"))),
+        ("Goals",          str(cc.get("goals",    "—"))),
+        ("Traps",          str(cc.get("traps",    "—"))),
+        ("Slippery cells", str(cc.get("slippery", "—"))),
+        ("Custom rewards", str(s.get("n_custom_cell_rewards", 0))),
+    ]))
+
+    # ── Rewards & Dynamics ─────────────────────────────────────────────
+    parts.append(_section("🎯 Rewards & Dynamics", [
+        ("Step reward",      f"{s.get('step_rew', 0):+.3f}"),
+        ("Goal reward",      f"{s.get('goal_rew', 0):+.3f}"),
+        ("Trap reward",      f"{s.get('trap_rew', 0):+.3f}"),
+        ("Discount  γ",      f"{s.get('gamma', 0.95):.3f}"),
+        ("Slip probability", f"{s.get('slip_prob', 0):.3f}"),
+    ]))
+
+    # ── Hyperparameters (algo-specific) ───────────────────────────────
+    if algo in ("Q-Learning", "SARSA"):
+        parts.append(_section("⚙️ Hyperparameters", [
+            ("Learning rate  α", f"{s.get('alpha', 0):.4f}"),
+            ("ε  initial",       f"{s.get('epsilon', 0):.3f}"),
+            ("ε  decay",         f"{s.get('epsilon_decay', 0):.4f}"),
+            ("ε  minimum",       f"{s.get('epsilon_min', 0.01):.3f}"),
+        ]))
+    elif algo == "DQN":
+        hidden     = s.get("dqn_hidden") or []
+        hidden_str = " → ".join(str(h) for h in hidden) if hidden else "—"
+        parts.append(_section("⚙️ DQN Parameters", [
+            ("Learning rate",  f"{s.get('dqn_lr', 0):.5f}"),
+            ("Hidden layers",  hidden_str),
+            ("Batch size",     str(s.get("dqn_batch", 64))),
+            ("Replay buffer",  f"{s.get('dqn_buffer', 0):,}"),
+            ("Target update",  f"every {s.get('dqn_target_update', 0)} steps"),
+            ("ε  initial",     f"{s.get('dqn_epsilon', 0):.3f}"),
+            ("ε  decay",       f"{s.get('dqn_epsilon_decay', 0):.5f}"),
+            ("ε  minimum",     f"{s.get('dqn_epsilon_min', 0):.3f}"),
+        ]))
+
+        # ── Observation space ──────────────────────────────────────────
+        n_nb     = s.get("obs_n_neighbors", 0)
+        obs_type = f"Local patch  (n={n_nb})" if n_nb > 0 else "One-hot position"
+        parts.append(_section("👁 Observation Space", [
+            ("Type",             obs_type),
+            ("Neighbor radius",  str(n_nb)),
+            ("Goal distance",    "✓" if s.get("obs_use_goal_dist") else "✗"),
+            ("Input dimension",  str(s.get("obs_input_dim", "—"))),
+        ]))
+
+        # ── Curriculum ────────────────────────────────────────────────
+        if s.get("curriculum_active"):
+            parts.append(_section("🎓 Curriculum", [
+                ("Method",                  s.get("curriculum_method", "—")),
+                ("Training setups",         str(s.get("curriculum_n_train", 0))),
+                ("Test setups (held-out)",  str(s.get("curriculum_n_test",  0))),
+                ("Advancement threshold",   f"{s.get('curriculum_threshold', 0):.2f}"),
+            ]))
+
+    # ── Results (populated after training) ────────────────────────────
+    if res is not None:
+        rews     = res.get("rewards") or []
+        ep_times = res.get("episode_times") or []
+        res_rows = []
+        if rews:
+            res_rows += [
+                ("Episodes run",          f"{len(rews):,}"),
+                ("Avg reward (last 100)", f"{float(np.mean(rews[-100:])):+.3f}"),
+                ("Peak reward",           f"{max(rews):+.3f}"),
+                ("Final reward",          f"{rews[-1]:+.3f}"),
+            ]
+        if ep_times:
+            res_rows.append(("Total training time", format_duration(sum(ep_times))))
+            res_rows.append(("Avg time / episode",
+                             f"{float(np.mean(ep_times)) * 1000:.0f} ms"))
+        if res_rows:
+            parts.append(_section("📊 Results", res_rows))
+
+    body     = "".join(parts)
+    stopped  = s.get("stopped_early", False)
+    n_done   = s.get("episodes_completed")
+    if stopped:
+        badge = (
+            '<span style="background:#fef3c7;color:#92400e;border:1px solid #fcd34d;'
+            'border-radius:4px;padding:2px 8px;font-size:0.7rem;font-weight:700;'
+            'margin-left:8px;vertical-align:middle">⏹ STOPPED EARLY</span>'
+        )
+        ep_note = (
+            f'<div style="font-size:0.72rem;color:#92400e;margin-top:4px">'
+            f'Completed {n_done:,} episodes before stopping.</div>'
+        ) if n_done is not None else ""
+    else:
+        badge    = ""
+        ep_note  = ""
+
+    card_html = (
+        '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
+        'padding:14px 16px;font-family:Inter,system-ui,sans-serif">'
+        '<div style="font-weight:700;font-size:0.88rem;color:#4F46E5;'
+        'margin-bottom:4px;padding-bottom:8px;border-bottom:2px solid #e0e7ff">'
+        f'🏋️ Training Setup{badge}'
+        '</div>'
+        + ep_note
+        + '<div style="margin-top:10px">'
+        + body
+        + '</div></div>'
+    )
+    st.markdown(card_html, unsafe_allow_html=True)
+
+
+def _grid_thumbnail_html(layout, rows, cols, cell_rewards=None):
+    """Compact inline-HTML mini-grid for curriculum thumbnails (no Plotly needed).
+
+    Parameters
+    ----------
+    cell_rewards : dict | None
+        Optional ``{(row, col): float}`` map.  Non-terminal cells with rewards
+        are tinted green (positive) or red (negative).
+    """
+    _CHAR_BASE = {
+        ".": "#F1F5F9", "#": "#1E293B", "~": "#BAE6FD",
+        "G": "#BBF7D0", "X": "#FECACA", "S": "#FEF08A",
+    }
+    cell_px = max(5, min(14, 70 // max(rows, cols)))
+    cr_map = cell_rewards or {}
+
+    divs = []
+    for ri, row_str in enumerate(layout):
+        for ci, ch in enumerate(row_str):
+            bg = _CHAR_BASE.get(ch, "#F1F5F9")
+            # Tint empty / slippery cells that carry a non-zero reward
+            if ch in (".", "~"):
+                rv = cr_map.get((ri, ci))
+                if rv is not None and float(rv) != 0:
+                    v = float(rv)
+                    t = min(1.0, abs(v) / 5.0)
+                    a = round(0.18 + 0.55 * t, 2)
+                    bg = (
+                        f"rgba(74,222,128,{a})" if v >= 0
+                        else f"rgba(248,113,113,{a})"
+                    )
+            # Emoji overlay for Start / Goal (only if cell is large enough)
+            label = ""
+            if cell_px >= 10:
+                if ch == "S":
+                    label = f'<span style="font-size:{cell_px - 2}px;line-height:1">🚦</span>'
+                elif ch == "G":
+                    label = f'<span style="font-size:{cell_px - 2}px;line-height:1">🏁</span>'
+            divs.append(
+                f'<div style="width:{cell_px}px;height:{cell_px}px;'
+                f'background:{bg};outline:0.5px solid rgba(0,0,0,0.08);'
+                f'display:flex;align-items:center;justify-content:center">'
+                f"{label}</div>"
+            )
+
+    return (
+        f'<div style="display:inline-grid;'
+        f'grid-template-columns:repeat({cols},{cell_px}px);'
+        f'gap:0;border:1.5px solid #CBD5E1;border-radius:4px;overflow:hidden">'
+        + "".join(divs)
+        + "</div>"
+    )
+
+
+# ── Session state defaults ────────────────────────────────────────────
+for _k, _v in {
+    "episodes": 3000,
+    "alpha": 0.1,
+    "dqn_hidden_str": "64,64",
+    "dqn_lr": 1e-3,
+    "dqn_batch_size": 64,
+    "dqn_buffer_size": 10_000,
+    "dqn_target_update": 100,
+    "dqn_episodes": 3000,
+    "dqn_epsilon": 1.0,
+    "dqn_epsilon_decay": 0.997,
+    "dqn_epsilon_min": 0.01,
+    "record_limit": 100,
+}.items():
+    st.session_state.setdefault(_k, _v)
+
+
+# ── Curriculum preview dialog ─────────────────────────────────────────
+@st.dialog("🎓 Curriculum Setups", width="large")
+def _curriculum_preview_dialog():
+    """Modal popup: thumbnail grid sorted by complexity → click to drill into detail."""
+    _all = sorted(
+        st.session_state.get("curriculum_setups", []),
+        key=lambda _s: _s["complexity"],
+    )
+    if not _all:
+        st.warning("No curriculum setups available. Create them first.")
+        return
+
+    _sel = st.session_state.get("_cur_sel", None)
+
+    if _sel is not None and 0 <= _sel < len(_all):
+        # ── Detail view ──────────────────────────────────────────────
+        _setup = _all[_sel]
+        _g = _layout_to_grid(_setup["layout"])
+
+        st.markdown(
+            f"### Setup #{_setup['index'] + 1} &nbsp;·&nbsp; "
+            f"Complexity **{_setup['complexity']:.1f} / 10**",
+            unsafe_allow_html=True,
+        )
+
+        _m1, _m2, _m3 = st.columns(3)
+        _m1.metric("Complexity", f"{_setup['complexity']:.1f}")
+        _m2.metric("Grid size", f"{_setup['rows']} × {_setup['cols']}")
+        _m3.metric("Position", f"{_sel + 1} / {len(_all)}")
+
+        _setup_cr = {
+            tuple(map(int, k.split(","))): float(v)
+            for k, v in _setup.get("cell_rewards", {}).items()
+        }
+        st.plotly_chart(
+            make_editor_fig(_g, _setup["rows"], _setup["cols"],
+                            cell_rewards=_setup_cr),
+            use_container_width=False,
+            key=f"_cur_detail_fig_{_sel}",
+        )
+
+        _n1, _n2, _n3 = st.columns([1, 1, 2])
+        if _n1.button(
+            "← Prev", use_container_width=True, disabled=(_sel == 0),
+            key="_cur_nav_prev",
+        ):
+            st.session_state["_cur_sel"] = _sel - 1
+        if _n2.button(
+            "Next →", use_container_width=True, disabled=(_sel == len(_all) - 1),
+            key="_cur_nav_next",
+        ):
+            st.session_state["_cur_sel"] = _sel + 1
+        if _n3.button(
+            "↩  Back to all setups", use_container_width=True,
+            key="_cur_nav_back",
+        ):
+            st.session_state["_cur_sel"] = None
+
+    else:
+        # ── Thumbnail grid ───────────────────────────────────────────
+        _n_show = min(30, len(_all))
+        _shown = [
+            round(i * (len(_all) - 1) / max(1, _n_show - 1))
+            for i in range(_n_show)
+        ]
+        st.markdown(
+            f"**{len(_all)} setups** sorted by complexity · "
+            f"showing {_n_show} samples · click **View** to inspect a setup"
+        )
+        st.divider()
+
+        _NCOLS = 5
+        for _rs in range(0, len(_shown), _NCOLS):
+            _row = _shown[_rs: _rs + _NCOLS]
+            _cols = st.columns(len(_row))
+            for _ci, _idx in enumerate(_row):
+                _s = _all[_idx]
+                _s_cr = {
+                    tuple(map(int, k.split(","))): float(v)
+                    for k, v in _s.get("cell_rewards", {}).items()
+                }
+                _thumb = _grid_thumbnail_html(
+                    _s["layout"], _s["rows"], _s["cols"], cell_rewards=_s_cr
+                )
+                _cols[_ci].markdown(
+                    f'<div style="text-align:center;margin-bottom:2px">{_thumb}</div>',
+                    unsafe_allow_html=True,
+                )
+                _cols[_ci].caption(f"c = {_s['complexity']:.1f}")
+                if _cols[_ci].button(
+                    "View",
+                    key=f"_cur_th_{_idx}",
+                    use_container_width=True,
+                ):
+                    st.session_state["_cur_sel"] = _idx
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🐕 GridWorld RL")
 
-    # Grid size
-    st.markdown("### Grid Size")
-    c1, c2 = st.columns(2)
-    n_rows = c1.number_input("Rows", 2, 14, st.session_state.rows,
-                             key="inp_rows", label_visibility="visible")
-    n_cols = c2.number_input("Cols", 2, 14, st.session_state.cols,
-                             key="inp_cols", label_visibility="visible")
-    bb1, bb2 = st.columns(2)
-    if bb1.button("Resize", use_container_width=True):
-        old = st.session_state.grid
-        g = _blank_grid(n_rows, n_cols)
-        for rr in range(min(n_rows, len(old))):
-            for cc in range(min(n_cols, len(old[0]))):
-                g[rr][cc] = old[rr][cc]
-        st.session_state.grid = g
-        st.session_state.rows = n_rows
-        st.session_state.cols = n_cols
-        st.rerun()
-    if bb2.button("Clear", use_container_width=True):
-        st.session_state.grid = _blank_grid(
-            st.session_state.rows, st.session_state.cols)
-        st.rerun()
+    # ── Game Setup ────────────────────────────────────────────────────
+    with st.expander("🗺️ Game Setup", expanded=True):
+        st.markdown("### Grid Size")
+        _c1, _c2 = st.columns(2)
+        n_rows = _c1.number_input("Rows", 2, 14, st.session_state.rows, key="inp_rows")
+        n_cols = _c2.number_input("Cols", 2, 14, st.session_state.cols, key="inp_cols")
+        _b1, _b2 = st.columns(2)
+        if _b1.button("Resize", use_container_width=True):
+            _old = st.session_state.grid
+            _g = _blank_grid(n_rows, n_cols)
+            for _rr in range(min(n_rows, len(_old))):
+                for _cc in range(min(n_cols, len(_old[0]))):
+                    _g[_rr][_cc] = _old[_rr][_cc]
+            st.session_state.grid = _g
+            st.session_state.rows = n_rows
+            st.session_state.cols = n_cols
+            st.rerun()
+        if _b2.button("Clear", use_container_width=True):
+            st.session_state.grid = _blank_grid(st.session_state.rows, st.session_state.cols)
+            st.rerun()
 
-    st.divider()
+        st.divider()
 
-    st.markdown("### Layout")
-    layout_file = st.file_uploader(
-        "Upload Layout", type=["json"],
-        help="Load a saved game layout with walls, goals, traps, rewards, and discount factor.",
-    )
-    if layout_file is not None:
-        try:
-            content = json.load(layout_file)
-            rows = int(content["rows"])
-            cols = int(content["cols"])
-            layout_lines = content["layout"]
-            if len(layout_lines) != rows:
-                raise ValueError("Layout rows do not match saved rows.")
-            if any(len(row) != cols for row in layout_lines):
-                raise ValueError("Layout columns do not match saved cols.")
-            st.session_state.grid = _layout_to_grid(layout_lines)
-            st.session_state.rows = rows
-            st.session_state.cols = cols
-            st.session_state.step_rew = float(content.get("step_reward", st.session_state.get("step_rew", 0.0)))
-            st.session_state.slip_prob = float(content.get("slip_prob", st.session_state.get("slip_prob", 0.3)))
-            st.session_state.gamma = float(content.get("gamma", st.session_state.get("gamma", 0.95)))
-            cell_rewards = {}
-            for k, v in content.get("cell_rewards", {}).items():
-                try:
-                    r_s, c_s = k.split(",")
-                    cell_rewards[(int(r_s), int(c_s))] = float(v)
-                except Exception:
-                    continue
-            st.session_state.cell_rewards = cell_rewards
-            st.success("Layout loaded successfully.")
-            _safe_rerun()
-        except Exception as exc:
-            st.error(f"Unable to load layout: {exc}")
-
-    prompt_text = st.text_area(
-        "Generation prompt",
-        value=st.session_state.get("layout_prompt", ""),
-        help=("Describe layout preferences for the random generator. "
-              "Examples: large positive terminal value, more negative rewards, fewer walls."),
-        key="layout_prompt",
-    )
-    use_claude = st.checkbox(
-        "Use Claude prompt to influence generation",
-        value=st.session_state.get("use_claude_prompt", False),
-        key="use_claude_prompt",
-        help="If enabled, the prompt is sent to Claude to bias the generated layout.",
-    )
-    if use_claude and prompt_text.strip() and not _get_claude_api_key():
-        st.warning("Claude API key is not configured. Set CLAUDE_API_KEY in the environment or Streamlit secrets.")
-
-    complexity = st.slider(
-        "Random layout complexity",
-        1, 10, st.session_state.get("layout_complexity", 1),
-        help="Choose how complex the randomly generated grid should be.",
-        key="layout_complexity",
-    )
-    if st.button("Generate random layout", use_container_width=True):
-        rows = st.session_state.rows
-        cols = st.session_state.cols
-        cell_rewards = {}
-        grid = None
-
-        # ── Claude full-grid path ─────────────────────────────────────
-        if use_claude and _get_claude_api_key() and prompt_text.strip():
-            with st.spinner("Asking Claude to design the grid…"):
-                grid, err = _generate_grid_from_claude(prompt_text, rows, cols, complexity)
-            if grid is not None:
-                st.success("Claude designed the grid from your prompt.")
-            else:
-                st.warning(f"Claude grid generation failed ({err}). Falling back to random generator.")
-                grid = None
-
-        # ── Fallback: local hints + random generator ──────────────────
-        if grid is None:
-            hints = None
-            if prompt_text.strip():
-                hints = _infer_layout_directives_from_prompt(prompt_text, rows, cols)
-                if hints:
-                    st.info("Using local prompt parsing to bias random layout generation.")
-            grid, cell_rewards = _generate_random_layout(complexity, rows, cols, hints=hints)
-            if not (use_claude and _get_claude_api_key()):
-                st.success("Generated a new random layout.")
-
-        st.session_state.grid = grid
-        st.session_state.cell_rewards = cell_rewards
-        st.session_state.results = None
-        st.session_state.train_run = None
-        st.session_state.loaded_training_metadata = None
-        st.session_state.play_trace = None
-        _safe_rerun()
-
-    training_file = st.file_uploader(
-        "Load Training Result", type=["json"],
-        help="Load a previously saved training result with metadata, configuration, board, and replay data.",
-        key="load_training_file",
-    )
-    if training_file is not None:
-        try:
-            payload = json.load(training_file)
-            _load_training_payload(payload)
-            st.success("Training result loaded successfully.")
-        except Exception as exc:
-            st.error(f"Unable to load training result: {exc}")
-
-    # Paint tool and rewards in one block
-    st.markdown("### Paint Tool & Rewards")
-    tool_idx = st.radio(
-        "tool", options=list(range(6)),
-        format_func=lambda i: f"  {CELL_LBL[i] or '·'}  {CELL_NAME[i]}",
-        label_visibility="collapsed",
-    )
-    st.session_state.tool = tool_idx
-
-    st.markdown("#### Step Reward")
-    step_rew = st.number_input("Step",  value=st.session_state.get("step_rew", 0.0), step=0.01, format="%.2f", key="step_rew")
-    # Use fixed defaults for Goal and Trap (can be set via per-cell rewards)
-    goal_rew = 1.0
-    trap_rew = -1.0
-
-    st.markdown("#### Paint-time Cell Reward")
-    c1, c2 = st.columns([2, 1])
-    paint_reward_value = c1.number_input("Cell reward", value=st.session_state.get("paint_reward_value", 0.0), step=0.01, format="%.2f", key="paint_reward_value")
-    paint_apply = c2.checkbox("Apply", value=False, key="paint_apply_reward", help="Apply reward when painting")
-    paint_clear = st.checkbox("Clear reward when painting", value=False, key="paint_clear_reward")
-
-    st.divider()
-    st.markdown("### Layout")
-    
-
-    # Dynamics
-    st.markdown("### Dynamics")
-    slip_prob = st.slider("Slip probability", 0.0, 1.0, st.session_state.get("slip_prob", 0.3), 0.01,
-                          help="Chance a slippery cell deflects the agent sideways",
-                          key="slip_prob")
-    gamma     = st.slider("Discount γ",       0.5, 1.0, st.session_state.get("gamma", 0.95), 0.01, key="gamma")
-
-    layout_data = {
-        "rows": st.session_state.rows,
-        "cols": st.session_state.cols,
-        "layout": _grid_to_layout(st.session_state.grid, st.session_state.rows, st.session_state.cols),
-        "step_reward": float(st.session_state.get("step_rew", 0.0)),
-        "goal_reward": 1.0,
-        "trap_reward": -1.0,
-        "slip_prob": float(st.session_state.get("slip_prob", 0.3)),
-        "gamma": float(st.session_state.get("gamma", 0.95)),
-        "cell_rewards": { f"{r},{c}": float(v) for (r,c), v in st.session_state.get("cell_rewards", {}).items() },
-    }
-    json_text = json.dumps(layout_data, indent=2)
-    st.download_button(
-        "Download Layout",
-        json_text,
-        file_name=f"gridworld_{layout_data['rows']}x{layout_data['cols']}.json",
-        mime="application/json",
-    )
-
-    # Play simulation from the Start cell (animate moves)
-    st.markdown("### Play From Start")
-    play_max_steps = st.number_input("Play max steps", 1, 1000, 100, key="play_max_steps")
-    play_delay = st.number_input("Delay per step (s)", 0.01, 2.0, 0.25, step=0.05, format="%.2f", key="play_delay")
-    play_policy = st.selectbox("Policy for play", ["Policy (if available)", "Random"], index=0, key="play_policy")
-    if st.button("Play from Start"):
-        try:
-            grid = st.session_state.grid
-            rows = st.session_state.rows
-            cols = st.session_state.cols
-            layout = _grid_to_layout(grid, rows, cols)
-            grid_cfg = GridConfig(
-                rows=rows, cols=cols, layout=layout,
-                step_reward=float(st.session_state.get("step_rew", 0.0)),
-                goal_reward=1.0, trap_reward=-1.0,
-                cell_rewards=st.session_state.get("cell_rewards", {}),
-                slippery_slip_prob=float(st.session_state.get("slip_prob", 0.3)),
-                gamma=float(st.session_state.get("gamma", 0.95)),
-            )
-            env_play = GridWorld(grid_cfg)
-            s = env_play.reset()
-            res = st.session_state.get("results") or {}
-            pol = res.get("policy") if isinstance(res, dict) else None
-            trace = {"states": [s], "actions": [], "rewards": [], "next_states": []}
-            for _ in range(play_max_steps):
-                valid = valid_actions(env_play, s)
-                if not valid:
-                    break
-                if play_policy == "Policy (if available)" and pol is not None and len(pol) == env_play.n_states:
-                    a = int(pol[s]) if int(pol[s]) in valid else int(random.choice(valid))
-                else:
-                    a = int(random.choice(valid))
-                ns, r, done = env_play.step(a)
-                trace["actions"].append(a)
-                trace["rewards"].append(r)
-                trace["next_states"].append(ns)
-                trace["states"].append(ns)
-                s = ns
-                if done:
-                    break
-            st.session_state["play_trace"] = trace
-            st.success(f"Play finished — steps: {len(trace['actions'])}, reward: {sum(trace['rewards']):+.2f}")
-        except Exception as exc:
-            st.error(f"Play failed: {exc}")
-
-    # Algorithm
-    st.markdown("### Algorithm")
-    algo = st.selectbox(
-        "algo", ["Policy Iteration", "Q-Learning", "SARSA", "DQN"],
-        label_visibility="collapsed",
-        key="algo",
-    )
-    # Run mode: full training or step-through
-    run_mode = st.selectbox(
-        "Run mode", ["Full", "Step-through"], index=0, label_visibility="collapsed",
-        key="run_mode",
-    )
-    if algo != "Policy Iteration":
-        episodes = st.number_input("Episodes", 200, 20_000, 3_000, 200)
-        alpha    = st.number_input("Learning rate α", 0.001, 1.0, 0.1, 0.005,
-                                   format="%.3f")
-        epsilon  = st.slider("Exploration ε", 0.0, 1.0, 1.0, 0.01,
-                             help="Initial exploration probability for ε-greedy policies.",
-                             key="epsilon")
-        epsilon_decay = st.number_input(
-            "Epsilon decay (multiplicative)", 0.900, 1.000, 0.998, 0.0005,
-            format="%.4f",
-            help="Per-episode multiplicative decay for ε (e.g. 0.998)",
-            key="epsilon_decay",
+        st.markdown("### Paint Tool & Rewards")
+        st.radio(
+            "Paint tool", options=list(range(6)),
+            format_func=lambda i: f"  {CELL_LBL[i] or '·'}  {CELL_NAME[i]}",
+            label_visibility="collapsed",
+            key="tool",
         )
-        exploring_starts = st.checkbox(
-            "Exploring starts (randomize episode start)", value=True,
-            help="If enabled, each episode starts in a random non-terminal cell.", key="exploring_starts",
+        st.markdown("#### Step Reward")
+        step_rew = st.number_input("Step", value=st.session_state.get("step_rew", 0.0), step=0.01, format="%.2f", key="step_rew")
+        st.checkbox(
+            "🧲 Potential-based goal shaping",
+            value=st.session_state.get("use_potential_shaping", True),
+            key="use_potential_shaping",
+            help=(
+                "Adds a shaping bonus F(s,s') = γ·Φ(s') − Φ(s) where "
+                "Φ(s) = −α·BFS_dist(s, goal).  Guaranteed to preserve the "
+                "optimal policy (Ng et al., 1999).  α = goal_reward / (rows+cols)."
+            ),
         )
-        max_steps = st.number_input("Max steps per episode", 1, 1000, 300, 10,
-                                    help="Maximum number of steps before the episode ends.",
-                                    key="max_steps")
-        # DQN-specific controls
-        if algo == "DQN":
-            st.markdown("---")
-            st.markdown("**DQN Parameters**")
-            dqn_hidden_str = st.text_input(
-                "Hidden layers (comma-separated)", value=st.session_state.get("dqn_hidden_str", "64,64"),
-                help="Sizes for hidden linear layers, e.g. 64,64", key="dqn_hidden_str",
-            )
+        st.markdown("#### Paint-time Cell Reward")
+        _pc1, _pc2 = st.columns([2, 1])
+        _pc1.number_input("Cell reward", value=st.session_state.get("paint_reward_value", 0.0), step=0.01, format="%.2f", key="paint_reward_value")
+        _pc2.checkbox("Apply", value=False, key="paint_apply_reward", help="Apply reward when painting")
+        st.checkbox("Clear reward when painting", value=False, key="paint_clear_reward")
+
+        st.divider()
+
+        st.markdown("### Dynamics")
+        slip_prob = st.slider("Slip probability", 0.0, 1.0, st.session_state.get("slip_prob", 0.3), 0.01,
+                              help="Chance a slippery cell deflects the agent sideways", key="slip_prob")
+        gamma = st.slider("Discount γ", 0.5, 1.0, st.session_state.get("gamma", 0.95), 0.01, key="gamma")
+
+        st.divider()
+
+        st.markdown("### Observation Space")
+        st.caption("DQN only — controls what the agent sees beyond its own position.")
+        st.slider(
+            "Neighbor radius n", 0, 4,
+            int(st.session_state.get("obs_n_neighbors", 0)),
+            help=(
+                "n=0: position only (one-hot, default).  "
+                "n=1: position + 8 direct neighbours.  "
+                "n=2: position + 24 neighbours, etc."
+            ),
+            key="obs_n_neighbors",
+        )
+        st.checkbox(
+            "Include goal distance (dx, dy)",
+            value=bool(st.session_state.get("obs_use_goal_dist", False)),
+            key="obs_use_goal_dist",
+            help="Appends normalised horizontal & vertical distance to the nearest Goal cell.",
+        )
+
+        st.divider()
+
+        st.markdown("### Layout")
+        _layout_file = st.file_uploader(
+            "Upload Layout", type=["json"],
+            help="Load a saved game layout with walls, goals, traps, rewards, and discount factor.",
+        )
+        if _layout_file is not None:
             try:
-                dqn_hidden = [int(s.strip()) for s in dqn_hidden_str.split(",") if s.strip()]
-                if not dqn_hidden:
-                    dqn_hidden = [64, 64]
-            except Exception:
-                dqn_hidden = [64, 64]
+                _content = json.load(_layout_file)
+                _rows = int(_content["rows"])
+                _cols = int(_content["cols"])
+                _lines = _content["layout"]
+                if len(_lines) != _rows:
+                    raise ValueError("Layout rows do not match saved rows.")
+                if any(len(_row) != _cols for _row in _lines):
+                    raise ValueError("Layout columns do not match saved cols.")
+                st.session_state.grid = _layout_to_grid(_lines)
+                st.session_state.rows = _rows
+                st.session_state.cols = _cols
+                st.session_state.step_rew = float(_content.get("step_reward", st.session_state.get("step_rew", 0.0)))
+                st.session_state.slip_prob = float(_content.get("slip_prob", st.session_state.get("slip_prob", 0.3)))
+                st.session_state.gamma = float(_content.get("gamma", st.session_state.get("gamma", 0.95)))
+                _cr = {}
+                for _k, _v in _content.get("cell_rewards", {}).items():
+                    try:
+                        _rs, _cs = _k.split(",")
+                        _cr[(int(_rs), int(_cs))] = float(_v)
+                    except Exception:
+                        continue
+                st.session_state.cell_rewards = _cr
+                st.success("Layout loaded successfully.")
+                _safe_rerun()
+            except Exception as _exc:
+                st.error(f"Unable to load layout: {_exc}")
 
-            dqn_lr = st.number_input("DQN learning rate", 1e-6, 1.0, st.session_state.get("dqn_lr", 1e-3), format="%.5f", key="dqn_lr")
-            dqn_batch_size = st.number_input("DQN batch size", 8, 4096, st.session_state.get("dqn_batch_size", 64), step=1, key="dqn_batch_size")
-            dqn_buffer_size = st.number_input("DQN buffer size", 100, 1_000_000, st.session_state.get("dqn_buffer_size", 10_000), step=100, key="dqn_buffer_size")
-            dqn_target_update = st.number_input("DQN target update (steps)", 1, 100_000, st.session_state.get("dqn_target_update", 100), step=1, key="dqn_target_update")
-            dqn_episodes = st.number_input("DQN episodes", 1, 50_000, episodes, step=100, key="dqn_episodes")
-            dqn_epsilon = st.number_input("DQN epsilon (initial)", 0.0, 1.0, st.session_state.get("dqn_epsilon", 1.0), step=0.01, format="%.3f", key="dqn_epsilon")
-            dqn_epsilon_decay = st.number_input("DQN epsilon decay", 0.900, 1.000, st.session_state.get("dqn_epsilon_decay", 0.997), step=0.0005, format="%.4f", key="dqn_epsilon_decay")
-            dqn_epsilon_min = st.number_input("DQN epsilon min", 0.0, 1.0, st.session_state.get("dqn_epsilon_min", 0.01), step=0.01, format="%.3f", key="dqn_epsilon_min")
+        st.text_area(
+            "Generation prompt",
+            value=st.session_state.get("layout_prompt", ""),
+            help="Describe layout preferences for the random generator.",
+            key="layout_prompt",
+        )
+        st.checkbox(
+            "Use Claude prompt to influence generation",
+            value=st.session_state.get("use_claude_prompt", False),
+            key="use_claude_prompt",
+            help="If enabled, the prompt is sent to Claude to bias the generated layout.",
+        )
+        if st.session_state.get("use_claude_prompt") and st.session_state.get("layout_prompt", "").strip() and not _get_claude_api_key():
+            st.warning("Claude API key is not configured. Set CLAUDE_API_KEY in the environment or Streamlit secrets.")
+        st.slider(
+            "Random layout complexity", 1, 10, st.session_state.get("layout_complexity", 1),
+            help="Choose how complex the randomly generated grid should be.",
+            key="layout_complexity",
+        )
+        if st.button("Generate random layout", use_container_width=True):
+            _rows = st.session_state.rows
+            _cols = st.session_state.cols
+            _cell_rewards = {}
+            _grid = None
+            _use_claude = st.session_state.get("use_claude_prompt", False)
+            _prompt = st.session_state.get("layout_prompt", "")
+            _complexity = st.session_state.get("layout_complexity", 1)
+            if _use_claude and _get_claude_api_key() and _prompt.strip():
+                with st.spinner("Asking Claude to design the grid…"):
+                    _grid, _err = _generate_grid_from_claude(_prompt, _rows, _cols, _complexity)
+                if _grid is not None:
+                    st.success("Claude designed the grid from your prompt.")
+                else:
+                    st.warning(f"Claude grid generation failed ({_err}). Falling back to random generator.")
+                    _grid = None
+            if _grid is None:
+                _hints = None
+                if _prompt.strip():
+                    _hints = _infer_layout_directives_from_prompt(_prompt, _rows, _cols)
+                    if _hints:
+                        st.info("Using local prompt parsing to bias random layout generation.")
+                _grid, _cell_rewards = _generate_random_layout(_complexity, _rows, _cols, hints=_hints)
+                if not (_use_claude and _get_claude_api_key()):
+                    st.success("Generated a new random layout.")
+            st.session_state.grid = _grid
+            st.session_state.cell_rewards = _cell_rewards
+            st.session_state.results = None
+            st.session_state.train_run = None
+            st.session_state.loaded_training_metadata = None
+            st.session_state.play_trace = None
+            _safe_rerun()
+
+        _ld = {
+            "rows": st.session_state.rows,
+            "cols": st.session_state.cols,
+            "layout": _grid_to_layout(st.session_state.grid, st.session_state.rows, st.session_state.cols),
+            "step_reward": float(st.session_state.get("step_rew", 0.0)),
+            "goal_reward": 1.0,
+            "trap_reward": -1.0,
+            "slip_prob": float(st.session_state.get("slip_prob", 0.3)),
+            "gamma": float(st.session_state.get("gamma", 0.95)),
+            "cell_rewards": {f"{_r},{_c}": float(_v) for (_r, _c), _v in st.session_state.get("cell_rewards", {}).items()},
+        }
+        st.download_button(
+            "Download Layout",
+            json.dumps(_ld, indent=2),
+            file_name=f"gridworld_{_ld['rows']}x{_ld['cols']}.json",
+            mime="application/json",
+        )
+
+    # ── Run Setup ─────────────────────────────────────────────────────
+    with st.expander("▶ Run Setup", expanded=False):
+        st.markdown("### Algorithm")
+        algo = st.selectbox(
+            "Algorithm", ["Policy Iteration", "Q-Learning", "SARSA", "DQN"],
+            label_visibility="collapsed",
+            key="algo",
+        )
+        run_mode = st.selectbox(
+            "Run mode", ["Full", "Step-through"], index=0, label_visibility="collapsed",
+            key="run_mode",
+        )
+
+        if algo != "Policy Iteration":
+            st.markdown("### Hyperparameters")
+            episodes = st.number_input("Episodes", 200, 20_000, int(st.session_state.get("episodes", 3000)), 200, key="episodes")
+            alpha = st.number_input("Learning rate α", 0.001, 1.0, float(st.session_state.get("alpha", 0.1)), 0.005,
+                                    format="%.3f", key="alpha")
+            epsilon = st.slider("Exploration ε", 0.0, 1.0, float(st.session_state.get("epsilon", 1.0)), 0.01,
+                                help="Initial exploration probability for ε-greedy policies.", key="epsilon")
+            epsilon_decay = st.number_input(
+                "Epsilon decay (multiplicative)", 0.900, 1.000, float(st.session_state.get("epsilon_decay", 0.998)), 0.0005,
+                format="%.4f", help="Per-episode multiplicative decay for ε", key="epsilon_decay",
+            )
+            exploring_starts = st.checkbox(
+                "Exploring starts (randomize episode start)", value=bool(st.session_state.get("exploring_starts", True)),
+                help="If enabled, each episode starts in a random non-terminal cell.", key="exploring_starts",
+            )
+            max_steps = st.number_input("Max steps per episode", 1, 1000, int(st.session_state.get("max_steps", 300)), 10,
+                                        help="Maximum number of steps before the episode ends.", key="max_steps")
+
+            if algo == "DQN":
+                st.markdown("---")
+                st.markdown("**DQN Parameters**")
+                dqn_hidden_str = st.text_input(
+                    "Hidden layers (comma-separated)", value=st.session_state.get("dqn_hidden_str", "64,64"),
+                    help="Sizes for hidden linear layers, e.g. 64,64", key="dqn_hidden_str",
+                )
+                try:
+                    dqn_hidden = [int(s.strip()) for s in dqn_hidden_str.split(",") if s.strip()] or [64, 64]
+                except Exception:
+                    dqn_hidden = [64, 64]
+                dqn_lr = st.number_input("DQN learning rate", 1e-6, 1.0, float(st.session_state.get("dqn_lr", 1e-3)), format="%.5f", key="dqn_lr")
+                dqn_batch_size = st.number_input("DQN batch size", 8, 4096, int(st.session_state.get("dqn_batch_size", 64)), step=1, key="dqn_batch_size")
+                dqn_buffer_size = st.number_input("DQN buffer size", 100, 1_000_000, int(st.session_state.get("dqn_buffer_size", 10_000)), step=100, key="dqn_buffer_size")
+                dqn_target_update = st.number_input("DQN target update (steps)", 1, 100_000, int(st.session_state.get("dqn_target_update", 100)), step=1, key="dqn_target_update")
+                dqn_episodes = st.number_input("DQN episodes", 1, 50_000, int(st.session_state.get("dqn_episodes", 3000)), step=100, key="dqn_episodes")
+                dqn_epsilon = st.number_input("DQN epsilon (initial)", 0.0, 1.0, float(st.session_state.get("dqn_epsilon", 1.0)), step=0.01, format="%.3f", key="dqn_epsilon")
+                dqn_epsilon_decay = st.number_input("DQN epsilon decay", 0.900, 1.000, float(st.session_state.get("dqn_epsilon_decay", 0.997)), step=0.0005, format="%.4f", key="dqn_epsilon_decay")
+                dqn_epsilon_min = st.number_input("DQN epsilon min", 0.0, 1.0, float(st.session_state.get("dqn_epsilon_min", 0.01)), step=0.01, format="%.3f", key="dqn_epsilon_min")
+
+                st.markdown("---")
+                st.markdown("**Curriculum Learning**")
+                st.checkbox(
+                    "Enable curriculum", key="use_curriculum",
+                    value=bool(st.session_state.get("use_curriculum", False)),
+                    help="Train DQN across environments of increasing difficulty.",
+                )
+                if st.session_state.get("use_curriculum"):
+                    st.selectbox(
+                        "Method", ["ADR", "Performance Threshold"],
+                        index=0, key="curriculum_method",
+                        help=(
+                            "ADR: automatically adjust difficulty based on recent reward.  "
+                            "Performance Threshold: advance stage when avg reward > threshold."
+                        ),
+                    )
+                    st.number_input(
+                        "Number of setups", 10, 10_000,
+                        int(st.session_state.get("n_curriculum_setups", 100)),
+                        step=10, key="n_curriculum_setups",
+                        help="Total number of grid layouts to generate across all difficulty levels.",
+                    )
+                    st.number_input(
+                        "Advancement threshold", -100.0, 100.0,
+                        float(st.session_state.get("curriculum_perf_threshold", 0.5)),
+                        step=0.1, format="%.2f", key="curriculum_perf_threshold",
+                        help="Avg episode reward (over last 20 eps) required to advance difficulty.",
+                    )
+                    _cx_lo, _cx_hi = st.columns(2)
+                    _cx_lo.number_input(
+                        "Min complexity", 1.0, 9.9,
+                        float(st.session_state.get("curriculum_min_complexity", 1.0)),
+                        step=0.5, format="%.1f", key="curriculum_min_complexity",
+                        help="Easiest grid difficulty to include (1 = trivial, 10 = hardest).",
+                    )
+                    _cx_hi.number_input(
+                        "Max complexity", 1.1, 10.0,
+                        float(st.session_state.get("curriculum_max_complexity", 10.0)),
+                        step=0.5, format="%.1f", key="curriculum_max_complexity",
+                        help="Hardest grid difficulty to include.",
+                    )
+
+                    _cc1, _cc2 = st.columns(2)
+                    if _cc1.button("Create Setups", use_container_width=True):
+                        _n_cur = int(st.session_state.get("n_curriculum_setups", 100))
+                        # Derive layout constraints from the Game Setup prompt so
+                        # that e.g. "no traps / one goal" is respected in every
+                        # generated curriculum setup.
+                        _cur_prompt = st.session_state.get("layout_prompt", "")
+                        _cur_hints = (
+                            _infer_layout_directives_from_prompt(
+                                _cur_prompt,
+                                st.session_state.rows,
+                                st.session_state.cols,
+                            )
+                            if _cur_prompt.strip()
+                            else {}
+                        )
+                        _cx_min_v = float(st.session_state.get("curriculum_min_complexity", 1.0))
+                        _cx_max_v = float(st.session_state.get("curriculum_max_complexity", 10.0))
+                        _cx_min_v, _cx_max_v = min(_cx_min_v, _cx_max_v - 0.1), max(_cx_max_v, _cx_min_v + 0.1)
+                        with st.spinner(f"Generating {_n_cur} setups (complexity {_cx_min_v:.1f}→{_cx_max_v:.1f})…"):
+                            _new_setups = _generate_curriculum_setups(
+                                _n_cur,
+                                st.session_state.rows,
+                                st.session_state.cols,
+                                step_reward=float(st.session_state.get("step_rew", 0.0)),
+                                slip_prob=float(st.session_state.get("slip_prob", 0.3)),
+                                gamma=float(st.session_state.get("gamma", 0.95)),
+                                hints=_cur_hints,
+                                min_complexity=_cx_min_v,
+                                max_complexity=_cx_max_v,
+                            )
+                            _n_train = max(1, int(len(_new_setups) * 0.8))
+                            st.session_state["curriculum_setups"] = _new_setups[:_n_train]
+                            st.session_state["curriculum_test_setups"] = _new_setups[_n_train:]
+                        _n_tr  = len(st.session_state.get("curriculum_setups", []))
+                        _n_te  = len(st.session_state.get("curriculum_test_setups", []))
+                        st.success(f"✓ {_n_tr} training setups + {_n_te} held-out test setups (complexity {_cx_min_v:.1f} → {_cx_max_v:.1f}).")
+
+                    _cur_existing = st.session_state.get("curriculum_setups")
+                    _has_setups = bool(_cur_existing)
+                    if _cc2.button("View Sample", use_container_width=True, disabled=not _has_setups):
+                        st.session_state["_cur_sel"] = None  # always open at thumbnail grid
+                        _curriculum_preview_dialog()
+
+                    if _has_setups:
+                        _n_te_ex = len(st.session_state.get("curriculum_test_setups", []))
+                        st.caption(f"✓ {len(_cur_existing)} training + {_n_te_ex} test setups ready.")
+                        _cur_json = json.dumps({
+                            "schema": "gridworld_curriculum_setups",
+                            "version": 1,
+                            "n_setups": len(_cur_existing),
+                            "setups": _cur_existing,
+                        }, indent=2)
+                        st.download_button(
+                            "💾 Download Setups", _cur_json,
+                            file_name="curriculum_setups.json",
+                            mime="application/json",
+                        )
+
+                    _cur_upload = st.file_uploader(
+                        "Load Setups from file", type=["json"],
+                        key="curriculum_upload",
+                    )
+                    if _cur_upload is not None:
+                        try:
+                            _loaded = json.load(_cur_upload)
+                            if _loaded.get("schema") == "gridworld_curriculum_setups":
+                                st.session_state["curriculum_setups"] = _loaded["setups"]
+                                st.success(f"Loaded {len(_loaded['setups'])} curriculum setups.")
+                            else:
+                                st.error("Not a valid curriculum setups file.")
+                        except Exception as _e:
+                            st.error(f"Could not load: {_e}")
+            else:
+                dqn_hidden = [64, 64]
+                dqn_lr = 1e-3
+                dqn_batch_size = 64
+                dqn_buffer_size = 10_000
+                dqn_target_update = 100
+                dqn_episodes = episodes
+                dqn_epsilon = 1.0
+                dqn_epsilon_decay = epsilon_decay
+                dqn_epsilon_min = 0.01
         else:
-            # sensible defaults when not using DQN
+            episodes = 0
+            alpha = 0.1
+            epsilon = st.session_state.get("epsilon", 1.0)
+            epsilon_decay = st.session_state.get("epsilon_decay", 0.998)
+            exploring_starts = st.session_state.get("exploring_starts", True)
+            max_steps = st.session_state.get("max_steps", 300)
             dqn_hidden = [64, 64]
             dqn_lr = 1e-3
             dqn_batch_size = 64
             dqn_buffer_size = 10_000
             dqn_target_update = 100
-            dqn_episodes = episodes
+            dqn_episodes = 3_000
             dqn_epsilon = 1.0
-            dqn_epsilon_decay = epsilon_decay
+            dqn_epsilon_decay = 0.997
             dqn_epsilon_min = 0.01
-    else:
-        episodes = 0
-        alpha    = 0.1
-        epsilon  = st.session_state.get("epsilon", 1.0)
-        epsilon_decay = st.session_state.get("epsilon_decay", 0.998)
-        exploring_starts = st.session_state.get("exploring_starts", True)
-        max_steps = st.session_state.get("max_steps", 300)
 
-        # default DQN values for non-DQN algorithms so the config object is complete
-        dqn_hidden = [64, 64]
-        dqn_lr = 1e-3
-        dqn_batch_size = 64
-        dqn_buffer_size = 10_000
-        dqn_target_update = 100
-        dqn_episodes = 3_000
-        dqn_epsilon = 1.0
-        dqn_epsilon_decay = 0.997
-        dqn_epsilon_min = 0.01
+        st.divider()
+        st.markdown("### Episode Recording")
+        st.checkbox(
+            "Record episodes for replay",
+            value=bool(st.session_state.get("record_episodes", False)),
+            key="record_episodes",
+            help="Store episode traces so you can replay episodes after training.",
+        )
+        st.selectbox(
+            "Replay retention", ["Most recent", "Subsample evenly"],
+            index=0, key="record_strategy",
+            help="Most recent keeps the latest episodes; subsample evenly keeps a periodic sample.",
+        )
+        st.number_input(
+            "Max recorded episodes", min_value=1, max_value=1000,
+            value=int(st.session_state.get("record_limit", 100)), step=1,
+            help="Keep this many recorded episodes for replay.", key="record_limit",
+        )
 
-    record_episodes = st.checkbox(
-        "Record episodes for replay",
-        value=st.session_state.get("record_episodes", False),
-        key="record_episodes",
-        help="Store episode traces so you can replay episodes after training.",
-    )
-    record_strategy = st.selectbox(
-        "Replay retention",
-        ["Most recent", "Subsample evenly"],
-        index=0,
-        key="record_strategy",
-        help="Most recent keeps the latest episodes; subsample evenly keeps a periodic sample across the full training run.",
-    )
-    record_limit = st.number_input(
-        "Max recorded episodes",
-        min_value=1, max_value=1000, value=100, step=1,
-        help="Keep this many recorded episodes for replay.",
-        key="record_limit",
-    )
+        st.divider()
+        st.markdown("### Load Training Result")
+        _training_file = st.file_uploader(
+            "Load Training Result", type=["json"],
+            help="Load a previously saved training result.",
+            key="load_training_file",
+        )
+        if _training_file is not None:
+            try:
+                _payload = json.load(_training_file)
+                _load_training_payload(_payload)
+                st.success("Training result loaded successfully.")
+            except Exception as _exc:
+                st.error(f"Unable to load training result: {_exc}")
+
+    # ── Analysis ──────────────────────────────────────────────────────
+    with st.expander("📊 Analysis", expanded=False):
+        st.markdown("### Play From Start")
+        play_max_steps = st.number_input("Play max steps", 1, 1000, int(st.session_state.get("play_max_steps", 100)), key="play_max_steps")
+        play_delay = st.number_input("Delay per step (s)", 0.01, 2.0, float(st.session_state.get("play_delay", 0.25)), step=0.05, format="%.2f", key="play_delay")
+        play_policy = st.selectbox("Policy for play", ["Policy (if available)", "Random"], index=0, key="play_policy")
+        if st.button("Play from Start"):
+            try:
+                grid = st.session_state.grid
+                rows = st.session_state.rows
+                cols = st.session_state.cols
+                layout = _grid_to_layout(grid, rows, cols)
+                grid_cfg = GridConfig(
+                    rows=rows, cols=cols, layout=layout,
+                    step_reward=float(st.session_state.get("step_rew", 0.0)),
+                    goal_reward=1.0, trap_reward=-1.0,
+                    cell_rewards=st.session_state.get("cell_rewards", {}),
+                    slippery_slip_prob=float(st.session_state.get("slip_prob", 0.3)),
+                    gamma=float(st.session_state.get("gamma", 0.95)),
+                )
+                env_play = GridWorld(grid_cfg)
+                s = env_play.reset()
+                res = st.session_state.get("results") or {}
+                pol = res.get("policy") if isinstance(res, dict) else None
+                trace = {"states": [s], "actions": [], "rewards": [], "next_states": []}
+                for _ in range(play_max_steps):
+                    valid = valid_actions(env_play, s)
+                    if not valid:
+                        break
+                    if play_policy == "Policy (if available)" and pol is not None and len(pol) == env_play.n_states:
+                        a = int(pol[s]) if int(pol[s]) in valid else int(random.choice(valid))
+                    else:
+                        a = int(random.choice(valid))
+                    ns, r, done = env_play.step(a)
+                    trace["actions"].append(a)
+                    trace["rewards"].append(r)
+                    trace["next_states"].append(ns)
+                    trace["states"].append(ns)
+                    s = ns
+                    if done:
+                        break
+                st.session_state["play_trace"] = trace
+                st.success(f"Play finished — steps: {len(trace['actions'])}, reward: {sum(trace['rewards']):+.2f}")
+            except Exception as exc:
+                st.error(f"Play failed: {exc}")
+
+        st.divider()
+        st.markdown("### Claude Settings")
+        _default_model = _get_claude_model_env() or "claude-opus-4-8"
+        _model_options = ["claude-opus-4-8", "claude-3", "claude-3.5", "claude-2", "claude-2.1", "claude-instant", "custom"]
+        _midx = _model_options.index(_default_model) if _default_model in _model_options else len(_model_options) - 1
+        _choice = st.selectbox("Claude model", _model_options, index=_midx, key="claude_model_choice")
+        if _choice == "custom":
+            _cur = st.session_state.get("CLAUDE_MODEL", _default_model)
+            _custom_val = _cur if _cur not in _model_options else ""
+            _custom = st.text_input("Custom Claude model", value=_custom_val, key="claude_model_custom")
+            st.session_state["CLAUDE_MODEL"] = _custom or _default_model
+        else:
+            st.session_state["CLAUDE_MODEL"] = _choice
 
     st.divider()
 
-    
+    # ── Reset-to-defaults ─────────────────────────────────────────────
+    _rb1, _rb2 = st.columns([3, 2])
+    _rb1.caption("Parameters are saved within the session.")
+    if _rb2.button("↩ Reset Defaults", help="Restore all training & dynamics parameters to their initial defaults"):
+        for _dk, _dv in _TRAINING_DEFAULTS.items():
+            st.session_state[_dk] = _dv
+        st.session_state.pop("training_summary", None)
+        st.rerun()
 
-    # Train button
     st.markdown('<div class="train-btn">', unsafe_allow_html=True)
-    train_clicked = st.button("▶  Train Agent", use_container_width=True)
+    train_clicked = (
+        st.button("▶  Train Agent", use_container_width=True)
+        or st.session_state.pop("auto_retrain", False)
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Step-through controls
+    # ── Stop Training button (visible while a run is in progress) ──────
+    _sidebar_tr = st.session_state.get("train_run")
+    if _sidebar_tr and not _sidebar_tr.get("finished", True):
+        if st.button("⏹ Stop Training", key="stop_training_btn",
+                     use_container_width=True,
+                     help="Stop the current run and keep results gathered so far"):
+            st.session_state["stop_training_requested"] = True
+            st.rerun()
+
     if run_mode == "Step-through":
         st.markdown("---")
         if st.button("Start Step-through", use_container_width=True):
-            # Initialize a step-run controller in session state
             st.session_state.step_run = {
                 "algo": algo,
-                "cfg": None,  # filled when training starts
+                "cfg": None,
                 "env": None,
                 "state": None,
                 "finished": False,
             }
             _safe_rerun()
+
+goal_rew = 1.0
+trap_rew = -1.0
+
 
 
 # ── Main layout ───────────────────────────────────────────────────────
@@ -2040,7 +3198,8 @@ st.markdown(
 )
 st.divider()
 
-left_col, right_col = st.columns([1, 1.5], gap="large")
+left_col  = st.container()
+right_col = st.container()
 
 # ── Grid editor ───────────────────────────────────────────────────────
 with left_col:
@@ -2125,11 +3284,21 @@ with left_col:
 
 # ── Results panel ─────────────────────────────────────────────────────
 with right_col:
+    # Placeholder filled by the training block when Train is clicked
+    _train_progress_ph = st.empty()
+
     st.markdown('<p class="section-title">📊 Results</p>', unsafe_allow_html=True)
 
     res = st.session_state.results
     tr = st.session_state.get("train_run")
-    if res is not None:
+    # True while a training batch is running (batches rerun every ~5 s)
+    _training_active = (
+        isinstance(tr, dict)
+        and not tr.get("finished", True)
+    )
+
+
+    if res is not None and not _training_active:
         loaded_meta = st.session_state.get("loaded_training_metadata")
         if loaded_meta:
             st.markdown("---")
@@ -2149,7 +3318,7 @@ with right_col:
                     rows.append({"Parameter": k, "Value": val})
                 if rows:
                     st.table(rows)
-    if res is None:
+    if res is None or _training_active:
         st.markdown("""
         <div style="background:#F8FAFC;border:2px dashed #CBD5E1;border-radius:16px;
                     padding:3rem;text-align:center;margin-top:1rem">
@@ -2168,159 +3337,472 @@ with right_col:
         lens   = res["lengths"]
         algo_  = res["algo"]
 
-        # Live training progress (if running)
-        if tr is not None:
-            st.markdown("---")
-            state = tr.get("state", {})
-            eps = state.get("episode", state.get("episodes", 0))
-            last_reward = None
-            if state.get("rewards"):
-                last_reward = state["rewards"][-1]
-            run_episodes = state.get("episode", state.get("episodes", 0))
-            elapsed = time.time() - tr.get("started_at", time.time())
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Current episode", f"{eps}")
-            c2.metric("Episodes performed", f"{run_episodes}")
-            c3.metric("Training time", format_duration(elapsed))
-            st.markdown(f"**Last reward:** {last_reward if last_reward is not None else '—'}")
-
-        # Metrics row
-        if rews is not None:
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Avg reward (last 100)", f"{np.mean(rews[-100:]):.3f}")
-            m2.metric("Peak reward",           f"{max(rews):.3f}")
-            m3.metric("Episodes",              f"{len(rews):,}")
-            off_steps = res.get("off_policy_steps")
-            if off_steps is not None and len(off_steps) > 0:
-                m4.metric("Avg off-policy steps", f"{np.mean(off_steps[-100:]):.2f}")
-            else:
-                m4.metric("Avg off-policy steps", "—")
-            total_time = sum(res.get("episode_times", []))
-            m5.metric("Training time", format_duration(total_time))
-
-        # Policy figure
-        st.plotly_chart(
-            make_policy_fig(env, policy, values),
-            use_container_width=False,
-            key="policy_fig",
-        )
-
-        # Visit counts grid (if available)
-        if res.get("visits") is not None:
-            st.markdown("<div class=\"section-title\">🔢 Visit Counts</div>", unsafe_allow_html=True)
-            st.plotly_chart(
-                make_visit_fig(env, res.get("visits")),
-                use_container_width=False,
-                key="visits_fig",
-            )
-
-        # Training curves
-        if rews is not None:
-            st.plotly_chart(
-                make_curves_fig(rews, lens, algo_, res.get("off_policy_steps")),
-                use_container_width=True,
-                key="curves_fig",
-            )
-            
-            # Training time analysis
-            episode_times = res.get("episode_times")
-            if episode_times is not None and len(episode_times) > 0:
-                st.plotly_chart(
-                    make_timing_fig(episode_times, algo_),
-                    use_container_width=True,
-                    key="timing_fig",
-                )
-            
-            # Epsilon decay analysis
-            epsilon_values = res.get("epsilon_values")
-            if epsilon_values is not None and len(epsilon_values) > 0:
-                st.plotly_chart(
-                    make_epsilon_fig(epsilon_values, algo_),
-                    use_container_width=True,
-                    key="epsilon_fig",
-                )
-
-            # Episode replay
-            episode_traces = res.get("episode_traces")
-            if episode_traces:
-                st.markdown("<div class=\"section-title\">🎬 Episode Replay</div>", unsafe_allow_html=True)
-                episode_index = st.selectbox(
-                    "Episode to replay",
-                    options=list(range(1, len(episode_traces) + 1)),
-                    index=0,
-                    format_func=lambda i: f"Episode {i}",
-                    key="replay_episode",
-                )
-                trace = episode_traces[episode_index - 1]
-                ep_steps = len(trace.get("actions", []))
-                ep_reward = sum(trace.get("rewards", []))
-                ep_off_policy = trace.get("off_policy_steps", 0)
-                c1, c2, c3, c4 = st.columns([1, 1, 1, 1.4])
-                c1.metric("Replay episode", f"{episode_index}")
-                c2.metric("Steps", f"{ep_steps}")
-                c3.metric("Off-policy steps", f"{ep_off_policy}")
-                c4.metric("Reward", f"{ep_reward:+.2f}")
-                st.plotly_chart(
-                    make_replay_fig(env, trace),
-                    use_container_width=False,
-                    key="replay_fig",
-                )
-
-            st.markdown("---")
-            st.markdown('<div class="section-title">💾 Save Training Result</div>', unsafe_allow_html=True)
-            save_name = st.text_input(
-                "Result name", value=st.session_state.get("save_result_name", f"{algo_} training"),
-                key="save_result_name",
-            )
-            save_description = st.text_area(
-                "Description",
-                value=st.session_state.get("save_result_description", ""),
-                key="save_result_description",
-                help="Optional notes about this training run.",
-            )
-            save_payload = _make_training_save_payload(
-                res,
-                GridConfig(
-                    rows=st.session_state.rows,
-                    cols=st.session_state.cols,
-                    layout=_grid_to_layout(st.session_state.grid, st.session_state.rows, st.session_state.cols),
-                    step_reward=float(st.session_state.get("step_rew", 0.0)),
-                    goal_reward=1.0,
-                    trap_reward=-1.0,
-                    cell_rewards=st.session_state.get("cell_rewards", {}),
-                    slippery_slip_prob=float(st.session_state.get("slip_prob", 0.3)),
-                    gamma=float(st.session_state.get("gamma", 0.95)),
-                ),
-                AlgorithmConfig(
-                    alpha=st.session_state.get("alpha", 0.1),
-                    n_episodes=st.session_state.get("episodes", 3000),
-                    dqn_n_episodes=st.session_state.get("episodes", 3000),
-                    max_steps=st.session_state.get("max_steps", 200),
-                    epsilon=st.session_state.get("epsilon", 1.0),
-                    epsilon_decay=st.session_state.get("epsilon_decay", 0.998),
-                    epsilon_min=st.session_state.get("epsilon", 1.0) if st.session_state.get("epsilon", 1.0) else 0.01,
-                    dqn_epsilon_decay=st.session_state.get("epsilon_decay", 0.998),
-                    exploring_starts=st.session_state.get("exploring_starts", False),
-                ),
-                save_name,
-                save_description,
-            )
-            save_json = json.dumps(save_payload, indent=2)
-            st.download_button(
-                "Download training result",
-                save_json,
-                file_name=f"{save_name or 'training_result'}.json",
-                mime="application/json",
-            )
+        _tsummary = st.session_state.get("training_summary")
+        if _tsummary:
+            _sum_col, _graph_col = st.columns([4, 7])
+            with _sum_col:
+                _render_training_summary_card(_tsummary, res)
         else:
-            pi_iters = res.get("pi_iters", "?")
-            st.success(f"Policy Iteration converged in **{pi_iters}** sweeps.", icon="✅")
-            st.info(
-                "Policy Iteration state values are expected returns from each state. "
-                "If the next action enters the goal, the adjacent state's value can be 1.0 "
-                "because the goal reward is received immediately upon reaching it.",
-                icon="ℹ️",
+            _graph_col = st.container()
+
+        with _graph_col:
+
+            # ── Stopped-early banner ─────────────────────────────────────
+            _stopped_ts = st.session_state.get("training_summary", {})
+            if _stopped_ts.get("stopped_early"):
+                _n_ep_done = _stopped_ts.get("episodes_completed", 0)
+                _n_ep_total = _stopped_ts.get("total_ep", _n_ep_done)
+                st.warning(
+                    f"⏹ **Training was stopped early** — {_n_ep_done:,} of "
+                    f"{_n_ep_total:,} planned episodes completed. "
+                    f"Results below reflect partial training.",
+                    icon=None,
+                )
+
+            # Live training progress (if running)
+            if tr is not None:
+                st.markdown("---")
+                state = tr.get("state", {})
+                eps = state.get("episode", state.get("episodes", 0))
+                last_reward = None
+                if state.get("rewards"):
+                    last_reward = state["rewards"][-1]
+                run_episodes = state.get("episode", state.get("episodes", 0))
+                elapsed = time.time() - tr.get("started_at", time.time())
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Current episode", f"{eps}")
+                c2.metric("Episodes performed", f"{run_episodes}")
+                c3.metric("Training time", format_duration(elapsed))
+                st.markdown(f"**Last reward:** {last_reward if last_reward is not None else '—'}")
+
+            # Metrics row
+            if rews is not None:
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Avg reward (last 100)", f"{np.mean(rews[-100:]):.3f}")
+                m2.metric("Peak reward",           f"{max(rews):.3f}")
+                m3.metric("Episodes",              f"{len(rews):,}")
+                off_steps = res.get("off_policy_steps")
+                if off_steps is not None and len(off_steps) > 0:
+                    m4.metric("Avg off-policy steps", f"{np.mean(off_steps[-100:]):.2f}")
+                else:
+                    m4.metric("Avg off-policy steps", "—")
+                total_time = sum(res.get("episode_times", []))
+                m5.metric("Training time", format_duration(total_time))
+
+            # Policy figure
+            st.plotly_chart(
+                make_policy_fig(env, policy, values),
+                use_container_width=False,
+                key="policy_fig",
             )
+
+            # Visit counts grid (if available)
+            if res.get("visits") is not None:
+                st.markdown("<div class=\"section-title\">🔢 Visit Counts</div>", unsafe_allow_html=True)
+                st.plotly_chart(
+                    make_visit_fig(env, res.get("visits")),
+                    use_container_width=False,
+                    key="visits_fig",
+                )
+
+            # Training curves
+            if rews is not None:
+                st.plotly_chart(
+                    make_curves_fig(rews, lens, algo_, res.get("off_policy_steps")),
+                    use_container_width=True,
+                    key="curves_fig",
+                )
+
+                # Training time analysis
+                episode_times = res.get("episode_times")
+                if episode_times is not None and len(episode_times) > 0:
+                    st.plotly_chart(
+                        make_timing_fig(episode_times, algo_),
+                        use_container_width=True,
+                        key="timing_fig",
+                    )
+
+                # Epsilon decay analysis
+                epsilon_values = res.get("epsilon_values")
+                if epsilon_values is not None and len(epsilon_values) > 0:
+                    st.plotly_chart(
+                        make_epsilon_fig(epsilon_values, algo_),
+                        use_container_width=True,
+                        key="epsilon_fig",
+                    )
+
+                # Curriculum complexity curve
+                _ep_cx = res.get("episode_complexities")
+                if _ep_cx:
+                    _cx_fig = make_complexity_fig(_ep_cx, algo_)
+                    if _cx_fig is not None:
+                        st.plotly_chart(
+                            _cx_fig,
+                            use_container_width=True,
+                            key="complexity_fig",
+                        )
+
+                # Episode replay
+                episode_traces = res.get("episode_traces")
+                if episode_traces:
+                    st.markdown("<div class=\"section-title\">🎬 Episode Replay</div>", unsafe_allow_html=True)
+                    # Build selector labels — include complexity when present
+                    _replay_gamma = getattr(env, "gamma", 0.99)
+                    def _ep_label(i, _g=_replay_gamma):
+                        t = episode_traces[i - 1]
+                        cx = t.get("complexity", 0.0)
+                        cx_str = f" · complexity {cx:.1f}" if cx > 0 else ""
+                        _rews = t.get("rewards", [])
+                        ep_r = sum((_g ** step) * r for step, r in enumerate(_rews))
+                        return f"Episode {i}{cx_str}  (return {ep_r:+.3f})"
+
+                    episode_index = st.selectbox(
+                        "Episode to replay",
+                        options=list(range(1, len(episode_traces) + 1)),
+                        index=0,
+                        format_func=_ep_label,
+                        key="replay_episode",
+                    )
+                    trace = episode_traces[episode_index - 1]
+                    ep_steps = len(trace.get("actions", []))
+                    _trace_rews = trace.get("rewards", [])
+                    # Discounted return — matches what the training curves record
+                    _gamma = getattr(env, "gamma", 0.99)
+                    ep_reward = sum(
+                        (_gamma ** t) * r for t, r in enumerate(_trace_rews)
+                    )
+                    # Undiscounted for reference
+                    ep_reward_raw = sum(_trace_rews)
+                    ep_off_policy = trace.get("off_policy_steps", 0)
+                    ep_complexity = trace.get("complexity", 0.0)
+
+                    _has_cx = ep_complexity > 0
+                    _metric_cols = st.columns([1, 1, 1, 1, 1.2] if _has_cx else [1, 1, 1, 1.4])
+                    _metric_cols[0].metric("Replay episode", f"{episode_index}")
+                    _metric_cols[1].metric("Steps", f"{ep_steps}")
+                    _metric_cols[2].metric("Off-policy steps", f"{ep_off_policy}")
+                    _metric_cols[3].metric(
+                        "Return (discounted)",
+                        f"{ep_reward:+.3f}",
+                        f"raw Σr = {ep_reward_raw:+.2f}",
+                        help=f"Discounted return Σγᵗrₜ with γ={_gamma}. "
+                             "Delta shows the undiscounted sum for comparison.",
+                    )
+                    if _has_cx:
+                        # Complexity badge — colour-coded low→high
+                        _cx_color = (
+                            "#10B981" if ep_complexity <= 3
+                            else "#F59E0B" if ep_complexity <= 7
+                            else "#EF4444"
+                        )
+                        _metric_cols[4].markdown(
+                            f"<div style='text-align:center;margin-top:6px'>"
+                            f"<div style='font-size:0.75rem;color:#6B7280;margin-bottom:2px'>Complexity</div>"
+                            f"<span style='font-size:1.5rem;font-weight:700;color:{_cx_color}'>"
+                            f"{ep_complexity:.1f}</span>"
+                            f"<span style='font-size:0.8rem;color:#9CA3AF'> / 10</span>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+                    st.plotly_chart(
+                        make_replay_fig(env, trace),
+                        use_container_width=False,
+                        key="replay_fig",
+                    )
+
+                st.markdown("---")
+                st.markdown('<div class="section-title">💾 Save Training Result</div>', unsafe_allow_html=True)
+                save_name = st.text_input(
+                    "Result name", value=st.session_state.get("save_result_name", f"{algo_} training"),
+                    key="save_result_name",
+                )
+                save_description = st.text_area(
+                    "Description",
+                    value=st.session_state.get("save_result_description", ""),
+                    key="save_result_description",
+                    help="Optional notes about this training run.",
+                )
+                save_payload = _make_training_save_payload(
+                    res,
+                    GridConfig(
+                        rows=st.session_state.rows,
+                        cols=st.session_state.cols,
+                        layout=_grid_to_layout(st.session_state.grid, st.session_state.rows, st.session_state.cols),
+                        step_reward=float(st.session_state.get("step_rew", 0.0)),
+                        goal_reward=1.0,
+                        trap_reward=-1.0,
+                        cell_rewards=st.session_state.get("cell_rewards", {}),
+                        slippery_slip_prob=float(st.session_state.get("slip_prob", 0.3)),
+                        gamma=float(st.session_state.get("gamma", 0.95)),
+                    ),
+                    AlgorithmConfig(
+                        alpha=st.session_state.get("alpha", 0.1),
+                        n_episodes=st.session_state.get("episodes", 3000),
+                        dqn_n_episodes=st.session_state.get("episodes", 3000),
+                        max_steps=st.session_state.get("max_steps", 200),
+                        epsilon=st.session_state.get("epsilon", 1.0),
+                        epsilon_decay=st.session_state.get("epsilon_decay", 0.998),
+                        epsilon_min=st.session_state.get("epsilon", 1.0) if st.session_state.get("epsilon", 1.0) else 0.01,
+                        dqn_epsilon_decay=st.session_state.get("epsilon_decay", 0.998),
+                        exploring_starts=st.session_state.get("exploring_starts", False),
+                    ),
+                    save_name,
+                    save_description,
+                )
+                save_json = json.dumps(save_payload, indent=2)
+                st.download_button(
+                    "Download training result",
+                    save_json,
+                    file_name=f"{save_name or 'training_result'}.json",
+                    mime="application/json",
+                )
+
+                # ── DQN post-training test ────────────────────────────────
+                _test_setups = st.session_state.get("curriculum_test_setups", [])
+                if algo_ == "DQN" and res.get("q_net") is not None and _test_setups:
+                    st.markdown("---")
+                    st.markdown('<div class="section-title">🧪 Test Agent</div>', unsafe_allow_html=True)
+                    st.caption(
+                        f"{len(_test_setups)} held-out test environments "
+                        f"(complexity {min(s['complexity'] for s in _test_setups):.1f}–"
+                        f"{max(s['complexity'] for s in _test_setups):.1f}) were never seen during training."
+                    )
+
+                    _ta, _tb = st.columns([2, 1])
+                    _cx_target = _ta.slider(
+                        "Target complexity",
+                        min_value=1.0, max_value=10.0,
+                        value=float(st.session_state.get("test_complexity", 5.0)),
+                        step=0.5,
+                        key="test_complexity",
+                        help="The agent is tested on held-out boards whose complexity is closest to this value (±1.5).",
+                    )
+                    _n_test_games = _tb.number_input(
+                        "Games to play", min_value=10, max_value=500,
+                        value=int(st.session_state.get("n_test_games", 50)),
+                        step=10, key="n_test_games",
+                    )
+
+                    # Show which test setups are in range
+                    _in_range = [s for s in _test_setups if abs(s["complexity"] - _cx_target) <= 1.5]
+                    if _in_range:
+                        st.caption(f"↳ {len(_in_range)} test boards in range "
+                                   f"(complexity {min(s['complexity'] for s in _in_range):.1f}–"
+                                   f"{max(s['complexity'] for s in _in_range):.1f})")
+                    else:
+                        st.caption("↳ No test boards within ±1.5 — will use the closest available boards.")
+
+                    if st.button("▶ Run Test", key="run_dqn_test_btn", use_container_width=True):
+                        with st.spinner(f"Testing on {_n_test_games} games at complexity ~{_cx_target:.1f}…"):
+                            _tq = res["q_net"]
+                            _tn = int(res.get("obs_n_neighbors", 0))
+                            _tg = bool(res.get("obs_use_goal_dist", False))
+                            _tres = _run_dqn_test(
+                                _tq, _test_setups, _cx_target,
+                                int(_n_test_games), _tn, _tg,
+                            )
+                            st.session_state["dqn_test_result"] = _tres
+
+                    _tshow = st.session_state.get("dqn_test_result")
+                    if _tshow:
+                        _r1, _r2, _r3, _r4 = st.columns(4)
+                        _r1.metric("Win rate",    f"{_tshow['win_rate']:.1%}")
+                        _r2.metric("Avg reward",  f"{_tshow['avg_reward']:+.3f}")
+                        _r3.metric("Avg steps",   f"{_tshow['avg_steps']:.1f}")
+                        _r4.metric("Games played", f"{_tshow['n_games']}")
+
+                        # Reward distribution bar chart
+                        _pg = _tshow["per_game"]
+                        _rw_vals = [g["reward"] for g in _pg]
+                        import math
+                        _n_bins = max(5, min(20, int(math.sqrt(len(_rw_vals)))))
+                        _mn, _mx = min(_rw_vals), max(_rw_vals)
+                        _bw = (_mx - _mn) / _n_bins if _mx > _mn else 1.0
+                        _bins = [_mn + i * _bw for i in range(_n_bins + 1)]
+                        _counts = [0] * _n_bins
+                        for rv in _rw_vals:
+                            bi = min(_n_bins - 1, int((rv - _mn) / _bw))
+                            _counts[bi] += 1
+                        _bin_labels = [f"{_bins[i]:.2f}" for i in range(_n_bins)]
+                        _bar_colors = [
+                            "#4ADE80" if ((_bins[i] + _bins[i+1]) / 2) >= 0 else "#F87171"
+                            for i in range(_n_bins)
+                        ]
+                        _test_fig = go.Figure(go.Bar(
+                            x=_bin_labels, y=_counts,
+                            marker_color=_bar_colors,
+                            hovertemplate="Reward: %{x}<br>Count: %{y}<extra></extra>",
+                        ))
+                        _test_fig.update_layout(
+                            title=dict(text="Reward distribution across test games", font_size=13),
+                            xaxis_title="Episode reward",
+                            yaxis_title="# games",
+                            height=260,
+                            margin=dict(l=30, r=10, t=40, b=40),
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            xaxis=dict(showgrid=False),
+                            yaxis=dict(gridcolor="#e2e8f0"),
+                        )
+                        st.plotly_chart(_test_fig, use_container_width=True, key="dqn_test_fig")
+                        st.caption(
+                            f"Tested against {_tshow['n_setups_used']} held-out board(s) "
+                            f"(greedy policy, ε=0)."
+                        )
+            else:
+                pi_iters = res.get("pi_iters", "?")
+                st.success(f"Policy Iteration converged in **{pi_iters}** sweeps.", icon="✅")
+                st.info(
+                    "Policy Iteration state values are expected returns from each state. "
+                    "If the next action enters the goal, the adjacent state's value can be 1.0 "
+                    "because the goal reward is received immediately upon reaching it.",
+                    icon="ℹ️",
+                )
+
+        # ── Analyze Last Run ────────────────────────────────────────────────
+        _saved_path = st.session_state.get("last_saved_run_path")
+        _an_summary = st.session_state.get("training_summary")
+        if _an_summary:
+            st.markdown("---")
+            st.markdown('<div class="section-title">🔍 Analyze Last Run</div>',
+                        unsafe_allow_html=True)
+
+            _an_col1, _an_col2 = st.columns([1, 2])
+            with _an_col1:
+                if _saved_path:
+                    st.caption(f"💾 Auto-saved: `{_saved_path}`")
+                if st.button("🔍 Analyze with AI", key="analyze_run_btn",
+                             use_container_width=True,
+                             help="Ask Claude to diagnose issues and suggest parameter changes"):
+                    with st.spinner("Analysing training run…"):
+                        try:
+                            _analysis_result = _call_claude_analysis(_an_summary, res)
+                            st.session_state["last_run_analysis"] = _analysis_result
+                            # Reset per-suggestion checkbox defaults
+                            for _si in range(len(_analysis_result.get("suggestions", []))):
+                                st.session_state.setdefault(f"sug_check_{_si}", True)
+                        except Exception as _ae:
+                            st.error(f"Analysis failed: {_ae}")
+
+            _analysis = st.session_state.get("last_run_analysis")
+            if _analysis:
+                # Issues
+                _issues = _analysis.get("issues", [])
+                if _issues:
+                    with _an_col2:
+                        st.markdown("**⚠️ Issues detected**")
+                        for _iss in _issues:
+                            st.warning(_iss)
+
+                # Suggestions with checkboxes
+                _sugs = _analysis.get("suggestions", [])
+                if _sugs:
+                    st.markdown("**💡 Suggested improvements**")
+                    for _si, _sug in enumerate(_sugs):
+                        _sc1, _sc2 = st.columns([0.05, 0.95])
+                        _is_checked = _sc1.checkbox(
+                            "", key=f"sug_check_{_si}",
+                            value=st.session_state.get(f"sug_check_{_si}", True),
+                        )
+                        with _sc2:
+                            _cur_val = st.session_state.get(_sug.get("param"), "—")
+                            st.markdown(
+                                f"**{_sug.get('text', '—')}**  "
+                                f"<span style='color:#64748b;font-size:0.8rem'>"
+                                f"`{_sug.get('param')}`: "
+                                f"{_cur_val} → **{_sug.get('value')}**</span>",
+                                unsafe_allow_html=True,
+                            )
+                            st.caption(_sug.get("explanation", ""))
+
+                    st.markdown("")
+                    if st.button("🔄 Try Again with selected suggestions",
+                                 key="try_again_btn", use_container_width=False):
+                        # Collect into a buffer — Streamlit forbids writing widget-bound
+                        # keys after they've been rendered; the buffer is applied at
+                        # script start on the next rerun (before widgets are drawn).
+                        _patch = {}
+                        for _si, _sug in enumerate(_sugs):
+                            if st.session_state.get(f"sug_check_{_si}", True):
+                                _pk = _sug.get("param")
+                                _pv = _sug.get("value")
+                                if _pk and _pk in _SUGGESTION_PARAM_TYPES:
+                                    _patch[_pk] = _pv
+                        st.session_state["_pending_param_changes"] = _patch
+                        # Clear stale results & trigger retrain
+                        st.session_state.results   = None
+                        st.session_state.pop("train_run", None)
+                        st.session_state.pop("last_run_analysis", None)
+                        st.session_state.pop("analysis_chat", None)
+                        st.session_state["auto_retrain"] = True
+                        st.rerun()
+
+                # ── Conversation thread ──────────────────────────────────
+                st.markdown("---")
+                st.markdown("**💬 Ask about this run**")
+                st.caption(
+                    "Ask a follow-up question about a suggestion, "
+                    "or anything about your training setup and results."
+                )
+
+                # Build a rich system prompt so Claude has full context
+                _chat_system = (
+                    "You are an expert reinforcement learning assistant helping a user "
+                    "analyse and improve a training run in a GridWorld RL playground.\n\n"
+                    "## Training setup\n"
+                    + "\n".join(
+                        f"- {k}: {v}"
+                        for k, v in (_an_summary or {}).items()
+                        if k not in ("hp_rows",)
+                    )
+                    + "\n\n## Analysis results\n"
+                    + "Issues detected:\n"
+                    + "\n".join(f"- {i}" for i in _analysis.get("issues", []))
+                    + "\n\nSuggestions:\n"
+                    + "\n".join(
+                        f"- {s.get('text')} "
+                        f"(param `{s.get('param')}`: {st.session_state.get(s.get('param'), '?')} → {s.get('value')}): "
+                        f"{s.get('explanation', '')}"
+                        for s in _analysis.get("suggestions", [])
+                    )
+                    + "\n\nAnswer clearly and concisely. "
+                    "If the user asks about a specific suggestion, explain the reasoning in depth."
+                )
+
+                # Display existing conversation history
+                _chat_history: list[dict] = st.session_state.get("analysis_chat", [])
+                for _msg in _chat_history:
+                    with st.chat_message(_msg["role"]):
+                        st.markdown(_msg["content"])
+
+                # Chat input
+                _chat_input = st.chat_input(
+                    "Ask a question about this run or any suggestion…",
+                    key="analysis_chat_input",
+                )
+                if _chat_input:
+                    _chat_history.append({"role": "user", "content": _chat_input})
+                    with st.chat_message("user"):
+                        st.markdown(_chat_input)
+                    with st.chat_message("assistant"):
+                        with st.spinner("Thinking…"):
+                            try:
+                                _reply = _call_claude_chat(
+                                    messages=_chat_history,
+                                    system=_chat_system,
+                                    max_tokens=800,
+                                )
+                            except Exception as _ce:
+                                _reply = f"⚠️ Could not reach Claude: {_ce}"
+                        st.markdown(_reply)
+                    _chat_history.append({"role": "assistant", "content": _reply})
+                    st.session_state["analysis_chat"] = _chat_history
+
+                # Clear conversation button
+                if _chat_history:
+                    if st.button("🗑 Clear conversation", key="clear_chat_btn"):
+                        st.session_state.pop("analysis_chat", None)
+                        st.rerun()
 
     # Step-through controls (advance one episode / sweep)
     if "step_run" in st.session_state:
@@ -2523,9 +4005,12 @@ with right_col:
                     sr["state"] = state
                     cfg = sr.get("cfg")
                     if not state:
+                        _n_nb = int(st.session_state.get("obs_n_neighbors", 0))
+                        _use_gd = bool(st.session_state.get("obs_use_goal_dist", False))
+                        _inp_dim = _obs_dim(env, _n_nb, _use_gd)
                         device = torch.device("cpu")
-                        q_net = QNetwork(env.n_states, env.n_actions, cfg.dqn_hidden).to(device)
-                        target_net = QNetwork(env.n_states, env.n_actions, cfg.dqn_hidden).to(device)
+                        q_net = QNetwork(_inp_dim, env.n_actions, cfg.dqn_hidden).to(device)
+                        target_net = QNetwork(_inp_dim, env.n_actions, cfg.dqn_hidden).to(device)
                         target_net.load_state_dict(q_net.state_dict())
                         target_net.eval()
                         optimizer = optim.Adam(q_net.parameters(), lr=cfg.dqn_lr)
@@ -2542,6 +4027,10 @@ with right_col:
                             "rewards": [],
                             "lengths": [],
                             "visits": np.zeros(env.n_states, dtype=int),
+                            "obs_n_neighbors": _n_nb,
+                            "obs_use_goal_dist": _use_gd,
+                            "adr_difficulty": 0.0,
+                            "curriculum_stage": 0,
                         })
 
                     q_net = state["q_net"]
@@ -2550,36 +4039,83 @@ with right_col:
                     buffer = state["buffer"]
                     eps = state["epsilon"]
                     total_steps = state["total_steps"]
+                    _n_nb = state.get("obs_n_neighbors", 0)
+                    _use_gd = state.get("obs_use_goal_dist", False)
 
-                    def state_vec(s):
-                        v = [0.0] * env.n_states
-                        v[s] = 1.0
-                        return v
+                    # ── Curriculum: pick episode environment ──────────
+                    _st_use_curric = st.session_state.get("use_curriculum", False)
+                    _st_curric_setups = st.session_state.get("curriculum_setups") or []
+                    _st_curric_method = st.session_state.get("curriculum_method", "ADR")
+                    _st_curric_thr = float(st.session_state.get("curriculum_perf_threshold", 0.5))
 
-                    # Run one episode
-                    s = env.reset()
+                    if _st_use_curric and _st_curric_setups:
+                        if _st_curric_method == "ADR":
+                            _adr = state.get("adr_difficulty", 0.0)
+                            _tgt = int(_adr * (len(_st_curric_setups) - 1))
+                            _spd = max(1, len(_st_curric_setups) // 10)
+                            _idx = max(0, min(len(_st_curric_setups) - 1,
+                                              _tgt + random.randint(-_spd, _spd)))
+                            episode_env = _setup_to_env(_st_curric_setups[_idx])
+                            if len(state["rewards"]) >= 20:
+                                _ar = float(np.mean(state["rewards"][-20:]))
+                                if _ar > _st_curric_thr:
+                                    state["adr_difficulty"] = min(1.0, _adr + 0.02)
+                                elif _ar < _st_curric_thr * 0.3:
+                                    state["adr_difficulty"] = max(0.0, _adr - 0.01)
+                        else:  # Performance Threshold
+                            _ns = min(10, len(_st_curric_setups))
+                            _stg = state.get("curriculum_stage", 0)
+                            _ps = max(1, len(_st_curric_setups) // _ns)
+                            _ss = _stg * _ps
+                            _se = min(len(_st_curric_setups), _ss + _ps)
+                            _idx = random.randint(_ss, _se - 1)
+                            episode_env = _setup_to_env(_st_curric_setups[_idx])
+                            if len(state["rewards"]) >= 20:
+                                _ar = float(np.mean(state["rewards"][-20:]))
+                                if _ar > _st_curric_thr and _stg < _ns - 1:
+                                    state["curriculum_stage"] = _stg + 1
+                    else:
+                        episode_env = env
+
+                    def state_vec(s, _e=episode_env):
+                        return _build_obs(_e, s, _n_nb, _use_gd)
+
+                    # Reset episode env
+                    if getattr(cfg, "exploring_starts", False):
+                        _vstates = [s for s in range(episode_env.n_states)
+                                    if not episode_env.is_wall(s) and not episode_env.is_terminal(s)]
+                        s = int(random.choice(_vstates)) if _vstates else episode_env.reset()
+                        episode_env.agent_pos = divmod(s, episode_env.cols)
+                        episode_env.done = False
+                    else:
+                        s = episode_env.reset()
+
                     sv = state_vec(s)
                     total_rew = 0.0
                     steps = 0
 
                     for _ in range(cfg.max_steps):
                         state["visits"][s] += 1
+                        valid = valid_actions(episode_env, s)
                         if random.random() < eps:
-                            action = random.randrange(env.n_actions)
+                            action = int(random.choice(valid)) if valid else random.randrange(episode_env.n_actions)
                         else:
                             with torch.no_grad():
                                 s_t = torch.tensor([sv], dtype=torch.float32)
-                                action = int(q_net(s_t).argmax(dim=1).item())
+                                q_values = q_net(s_t).squeeze(0)
+                                action = (
+                                    int(max(valid, key=lambda a: float(q_values[a])))
+                                    if valid else int(q_values.argmax().item())
+                                )
 
-                        ns, r, done = env.step(action)
-                        # count arrival
+                        ns, r, done = episode_env.step(action)
                         state["visits"][ns] += 1
                         next_sv = state_vec(ns)
-                        total_rew += (env.gamma ** steps) * r
+                        total_rew += (episode_env.gamma ** steps) * r
                         steps += 1
                         total_steps += 1
 
-                        buffer.push(sv, action, r, next_sv, 1.0 if done else 0.0)
+                        buffer.push(sv, action, float(np.clip(r, -10.0, 10.0)), next_sv, 1.0 if done else 0.0)
                         s = ns
                         sv = next_sv
 
@@ -2596,12 +4132,14 @@ with right_col:
                             current_q = q_net(s_t).gather(1, a_t.unsqueeze(1)).squeeze(1)
                             with torch.no_grad():
                                 max_next_q = target_net(ns_t).max(dim=1)[0]
-                                target_q = r_t + env.gamma * max_next_q * (1.0 - d_t)
+                                target_q = r_t + episode_env.gamma * max_next_q * (1.0 - d_t)
 
                             loss = nn.functional.mse_loss(current_q, target_q)
-                            optimizer.zero_grad()
-                            loss.backward()
-                            optimizer.step()
+                            if not torch.isnan(loss) and not torch.isinf(loss):
+                                optimizer.zero_grad()
+                                loss.backward()
+                                torch.nn.utils.clip_grad_norm_(q_net.parameters(), max_norm=10.0)
+                                optimizer.step()
 
                         if total_steps % cfg.dqn_target_update == 0:
                             target_net.load_state_dict(q_net.state_dict())
@@ -2616,11 +4154,11 @@ with right_col:
                     state["rewards"].append(total_rew)
                     state["lengths"].append(steps)
 
-                    # Extract Q-table for visualization
-                    all_states = [[1.0 if i == s else 0.0 for i in range(env.n_states)]
-                                  for s in range(env.n_states)]
+                    # Extract Q-table against main env for visualisation
+                    all_obs_st = [_build_obs(env, _si, _n_nb, _use_gd)
+                                  for _si in range(env.n_states)]
                     with torch.no_grad():
-                        Q_list = q_net(torch.tensor(all_states, dtype=torch.float32)).tolist()
+                        Q_list = q_net(torch.tensor(all_obs_st, dtype=torch.float32)).tolist()
                     Q_table = np.array(Q_list, dtype=np.float64)
                     policy = np.argmax(Q_table, axis=1)
 
@@ -2641,19 +4179,114 @@ with right_col:
                 _safe_rerun()
 
 
+# ── Handle stop-training request ──────────────────────────────────────
+# Runs at script start (before any widget rendering) so we can safely write
+# to widget-bound keys and then trigger a clean rerun.
+if st.session_state.pop("stop_training_requested", False):
+    _stop_tr = st.session_state.get("train_run")
+    if _stop_tr and not _stop_tr.get("finished", True):
+        _stop_state = _stop_tr.get("state") or {}
+        _stop_env   = _stop_tr.get("env")
+        _stop_algo  = _stop_tr.get("algo", "")
+
+        # ── Reconstruct results from training state ──────────────────
+        # Per-episode session_state.results writes may not have committed
+        # if Streamlit interrupted the training thread mid-episode.
+        # We always rebuild from train_run["state"] which is updated every
+        # episode via the live dict reference (tr["state"] = state).
+        _stop_rews  = list(_stop_state.get("rewards") or [])
+        _n_done     = len(_stop_rews)
+
+        if _stop_env and _n_done > 0:
+            _stop_Q = _stop_state.get("Q")
+            if _stop_Q is not None:
+                # Q-Learning / SARSA
+                _stop_policy = np.argmax(_stop_Q, axis=1)
+                _stop_values = _stop_Q.max(axis=1)
+                st.session_state.results = dict(
+                    algo          = _stop_algo,
+                    env           = _stop_env,
+                    policy        = _stop_policy,
+                    values        = _stop_values,
+                    rewards       = _stop_rews,
+                    lengths       = list(_stop_state.get("lengths") or []),
+                    visits        = _stop_state.get("visits"),
+                    episode_times = _stop_state.get("episode_times"),
+                    off_policy_steps     = _stop_state.get("off_policy_steps"),
+                    epsilon_values       = _stop_state.get("epsilon_values"),
+                    episode_traces       = _stop_state.get("episode_traces"),
+                    episode_complexities = list(_stop_state.get("episode_complexities") or []),
+                )
+            else:
+                # DQN — per-episode results are richer; fall back to whatever
+                # was last committed, but at minimum patch in the rewards list
+                _existing = st.session_state.results
+                if isinstance(_existing, dict) and _existing.get("env") is not None:
+                    _existing["rewards"] = _stop_rews
+                    _existing["lengths"] = list(_stop_state.get("lengths") or [])
+                    _existing["episode_times"] = _stop_state.get("episode_times")
+                    _existing["epsilon_values"] = _stop_state.get("epsilon_values")
+                    st.session_state.results = _existing
+                # If even that is absent, leave st.session_state.results as-is
+                # (DQN sets it every episode so it should exist after ep > 0)
+
+        # ── Annotate training summary with partial-run metadata ──────
+        _stop_ts = st.session_state.get("training_summary") or {}
+        _stop_ts["stopped_early"]      = True
+        _stop_ts["episodes_completed"] = _n_done
+        _stop_ts["total_ep"]           = _n_done
+        st.session_state["training_summary"] = _stop_ts
+
+        # ── Clean up the active training run ─────────────────────────
+        st.session_state.pop("train_run", None)
+
+        # ── Auto-save partial results ─────────────────────────────────
+        try:
+            _stop_path = _auto_save_run(_stop_ts, st.session_state.results or {})
+            if _stop_path:
+                st.session_state["last_saved_run_path"] = _stop_path
+        except Exception:
+            pass
+
+    # Rerun so the results panel renders cleanly with the saved partial data
+    st.rerun()
+
+
 # ── Training logic ────────────────────────────────────────────────────
-if train_clicked:
+# Resume condition: training was started but not finished, and user hasn't clicked Stop
+_tr_resume = (
+    isinstance(st.session_state.get("train_run"), dict)
+    and not st.session_state.get("train_run", {}).get("finished", True)
+    and not st.session_state.get("stop_training_requested")
+)
+if train_clicked or _tr_resume:
     grid = st.session_state.grid
     rows = st.session_state.rows
     cols = st.session_state.cols
 
     flat = [grid[r][c] for r in range(rows) for c in range(cols)]
+
+    # When DQN curriculum is active the drawn grid is used only for policy
+    # visualisation after training; actual episodes run on curriculum envs.
+    _curriculum_active = (
+        algo == "DQN"
+        and bool(st.session_state.get("use_curriculum", False))
+        and bool(st.session_state.get("curriculum_setups"))
+    )
+
     if ST not in flat:
         st.sidebar.error("❌ Grid needs a Start cell (S).")
         st.stop()
-    if GO not in flat:
+    if GO not in flat and not _curriculum_active:
         st.sidebar.error("❌ Grid needs at least one Goal cell (G).")
         st.stop()
+    if GO not in flat and _curriculum_active:
+        st.sidebar.info(
+            "ℹ️ No Goal on the drawn grid — training will run entirely on the "
+            f"{len(st.session_state['curriculum_setups'])} curriculum setups. "
+            "The drawn grid is used only for final policy visualisation.",
+            icon="🎓",
+        )
 
     layout = _grid_to_layout(grid, rows, cols)
 
@@ -2682,380 +4315,725 @@ if train_clicked:
         exploring_starts=exploring_starts,
     )
 
-    with st.spinner(f"Training with **{algo}** — please wait…"):
-        env = GridWorld(grid_cfg)
-        # If step-through mode requested, initialise controller and don't run full training
-        if run_mode == "Step-through":
-            sr = st.session_state.setdefault("step_run", {})
-            sr["algo"] = algo
-            sr["cfg"] = algo_cfg
-            sr["env"] = env
-            sr.setdefault("state", None)
-            sr.setdefault("finished", False)
-            _safe_rerun()
+    _n_cur   = len(st.session_state["curriculum_setups"]) if _curriculum_active else 0
+    _method  = st.session_state.get("curriculum_method", "ADR") if _curriculum_active else ""
+    _total_ep = dqn_episodes if algo == "DQN" else (1 if algo == "Policy Iteration" else episodes)
 
-        if algo == "Policy Iteration":
-            pol, vals, hist = policy_iteration(env, algo_cfg)
-            st.session_state.results = dict(
-                algo=algo, env=env, policy=pol, values=vals,
-                rewards=None, lengths=None, pi_iters=len(hist),
-            )
-        else:
-            # Resumable full training loop stored in session_state['train_run']
-            if not isinstance(st.session_state.get("train_run"), dict):
-                st.session_state.train_run = {}
-            tr = st.session_state.train_run
-            tr.setdefault("algo", algo)
-            tr.setdefault("cfg", algo_cfg)
-            tr.setdefault("env", env)
-            tr.setdefault("state", None)
-            tr.setdefault("finished", False)
-            tr.setdefault("last_update", 0.0)
-            tr.setdefault("started_at", time.time())
+    # ── Observation settings (always computed, even for non-DQN) ───────
+    _n_nb_now   = int(st.session_state.get("obs_n_neighbors", 0))
+    _use_gd_now = bool(st.session_state.get("obs_use_goal_dist", False))
+    if _n_nb_now == 0 and not _use_gd_now:
+        _inp_dim_now = rows * cols
+    else:
+        _inp_dim_now = 2 + ((2 * _n_nb_now + 1) ** 2 - 1 if _n_nb_now > 0 else 0) + (2 if _use_gd_now else 0)
 
-            cfg = tr["cfg"]
-            env = tr["env"]
+    # ── Grid cell counts ────────────────────────────────────────────────
+    _gc: dict = {}
+    for _cn, _cv in [("walls", 1), ("slippery", 2), ("goals", 3), ("traps", 4)]:
+        _gc[_cn] = int(np.sum(grid == _cv))
+    _gc["empty"] = int(np.sum(grid == 0))
 
-            # Initialize per-algo state if needed
-            state = tr.get("state") or {}
-            if state == {}:
-                if algo == "Q-Learning" or algo == "SARSA":
-                    state["Q"] = np.zeros((env.n_states, env.n_actions), dtype=np.float64)
-                    state["epsilon"] = cfg.epsilon
-                    state["episode"] = 0
-                    state["rewards"] = []
-                    state["lengths"] = []
-                    state["episode_times"] = []
-                    state["off_policy_steps"] = []
-                    state["epsilon_values"] = []
-                    state["episode_traces"] = []
-                    state["episode_traces_all"] = []
-                    state["visits"] = np.zeros(env.n_states, dtype=int)
-                elif algo == "DQN":
-                    device = torch.device("cpu")
-                    q_net = QNetwork(env.n_states, env.n_actions, cfg.dqn_hidden).to(device)
-                    target_net = QNetwork(env.n_states, env.n_actions, cfg.dqn_hidden).to(device)
-                    target_net.load_state_dict(q_net.state_dict())
-                    target_net.eval()
-                    optimizer = optim.Adam(q_net.parameters(), lr=cfg.dqn_lr)
-                    buffer = ReplayBuffer(cfg.dqn_buffer_size)
-                    state.update({
-                        "q_net": q_net,
-                        "target_net": target_net,
-                        "optimizer": optimizer,
-                        "buffer": buffer,
-                        "epsilon": cfg.dqn_epsilon,
-                        "total_steps": 0,
-                        "episodes": 0,
-                        "rewards": [],
-                        "lengths": [],
-                        "episode_times": [],
-                        "off_policy_steps": [],
-                        "epsilon_values": [],
-                        "episode_traces": [],
-                        "episode_traces_all": [],
-                        "visits": np.zeros(env.n_states, dtype=int),
-                    })
-                tr["state"] = state
+    # ── Compact hp_rows (for the status panel captions) ─────────────────
+    _hp_rows: list[str] = []
+    if algo == "Policy Iteration":
+        _hp_rows.append(f"γ={gamma:.2f} · step={step_rew:+.2f} · goal={goal_rew:+.2f} · trap={trap_rew:+.2f}")
+    elif algo in ("Q-Learning", "SARSA"):
+        _hp_rows.append(f"α={alpha:.4f}  ε₀={epsilon:.3f}  decay={epsilon_decay:.4f}  max_steps={max_steps}")
+        _hp_rows.append(f"γ={gamma:.2f} · step={step_rew:+.2f} · goal={goal_rew:+.2f} · trap={trap_rew:+.2f} · slip={slip_prob:.2f}")
+    elif algo == "DQN":
+        _hp_rows.append(f"lr={dqn_lr:.5f}  batch={dqn_batch_size}  buffer={dqn_buffer_size}  target_update={dqn_target_update}")
+        _hp_rows.append(f"hidden={dqn_hidden}  ε₀={dqn_epsilon:.3f}→{dqn_epsilon_min:.3f}×{dqn_epsilon_decay:.4f}")
+        _hp_rows.append(f"γ={gamma:.2f} · step={step_rew:+.2f} · goal={goal_rew:+.2f} · trap={trap_rew:+.2f} · slip={slip_prob:.2f}")
+        _obs_label = f"obs: n_neighbors={_n_nb_now}"
+        if _use_gd_now:
+            _obs_label += " + goal_dist"
+        _obs_label += f"  →  input_dim={_inp_dim_now}"
+        _hp_rows.append(_obs_label)
+        if _curriculum_active:
+            _hp_rows.append(f"🎓 Curriculum: {_method} · {_n_cur} setups · threshold {st.session_state.get('curriculum_perf_threshold', 0.5):.2f}")
 
-            now = time.time()
+    # ── Comprehensive training summary (persisted in session state) ──────
+    _n_test_setups = len(st.session_state.get("curriculum_test_setups", []))
+    st.session_state["training_summary"] = {
+        # Identity
+        "algo":             algo,
+        "run_mode":         run_mode,
+        # Grid
+        "rows":             rows,
+        "cols":             cols,
+        "total_ep":         _total_ep,
+        "cell_counts":      _gc,
+        "n_custom_cell_rewards": len(st.session_state.get("cell_rewards", {})),
+        # Rewards & dynamics
+        "step_rew":         float(step_rew),
+        "goal_rew":         float(goal_rew),
+        "trap_rew":         float(trap_rew),
+        "gamma":            float(gamma),
+        "slip_prob":        float(slip_prob),
+        # Common training
+        "max_steps":        int(max_steps),
+        "exploring_starts": bool(exploring_starts),
+        # Q / SARSA params
+        "alpha":            float(st.session_state.get("alpha", 0.1)),
+        "epsilon":          float(st.session_state.get("epsilon", 1.0)),
+        "epsilon_decay":    float(st.session_state.get("epsilon_decay", 0.998)),
+        "epsilon_min":      0.01,
+        # DQN params
+        "dqn_lr":           float(st.session_state.get("dqn_lr", 1e-3)),
+        "dqn_hidden":       list(dqn_hidden) if algo == "DQN" else None,
+        "dqn_batch":        int(st.session_state.get("dqn_batch_size", 64)),
+        "dqn_buffer":       int(st.session_state.get("dqn_buffer_size", 10_000)),
+        "dqn_target_update":int(st.session_state.get("dqn_target_update", 100)),
+        "dqn_epsilon":      float(st.session_state.get("dqn_epsilon", 1.0)),
+        "dqn_epsilon_decay":float(st.session_state.get("dqn_epsilon_decay", 0.997)),
+        "dqn_epsilon_min":  float(st.session_state.get("dqn_epsilon_min", 0.01)),
+        # Observation (DQN)
+        "obs_n_neighbors":  _n_nb_now,
+        "obs_use_goal_dist":_use_gd_now,
+        "obs_input_dim":    _inp_dim_now,
+        # Curriculum
+        "curriculum_active":     bool(_curriculum_active),
+        "curriculum_method":     _method,
+        "curriculum_n_train":    int(_n_cur),
+        "curriculum_n_test":     int(_n_test_setups),
+        "curriculum_threshold":  float(st.session_state.get("curriculum_perf_threshold", 0.5)),
+        # Reward shaping
+        "potential_shaping":     bool(st.session_state.get("use_potential_shaping", True)),
+        "shaping_alpha":         round(1.0 / max(1, rows + cols), 4),
+        # Legacy captions for the status panel
+        "hp_rows":          _hp_rows,
+    }
 
-            # Run episodes until we need to update UI or finish
-            update_interval = 5.0
-            start_time = time.time()
-            # loop and perform episodes
-            while True:
-                if tr.get("finished"):
-                    break
-                episode_start_time = time.time()
-                if algo == "Q-Learning":
-                    Q = state["Q"]
-                    eps = state["epsilon"]
+    # ── Training status panel (shown in the results placeholder) ─────
+    # Peek at saved state so we can restore progress on resume reruns
+    _saved_tr_peek    = st.session_state.get("train_run") or {}
+    _saved_state_peek = _saved_tr_peek.get("state") or {}
+    _ep_restored      = len(_saved_state_peek.get("rewards") or [])
+    _init_frac        = min(1.0, _ep_restored / max(1, _total_ep)) if _ep_restored > 0 else 0.0
+    _init_text        = (
+        f"Episode {_ep_restored:,} / {_total_ep:,}" if _ep_restored > 0 else "Initializing…"
+    )
 
-                    # one episode
-                    if getattr(cfg, "exploring_starts", False):
-                        valid_states = [s for s in range(env.n_states) if not env.is_wall(s) and not env.is_terminal(s)]
-                        s = int(random.choice(valid_states))
-                        env.agent_pos = divmod(s, env.cols)
-                        env.done = False
+    with _train_progress_ph.container():
+        with st.status("🏋️ Training in progress…", expanded=True) as _train_status:
+            # ── Training plan summary ────────────────────────────────
+            _sv1, _sv2, _sv3 = st.columns(3)
+            _sv1.metric("Algorithm", algo)
+            _sv2.metric("Grid", f"{rows}×{cols}")
+            _sv3.metric("Episodes", f"{_total_ep:,}")
+            if _hp_rows:
+                for _hr in _hp_rows:
+                    st.caption(_hr)
+            st.divider()
+            # ── Live progress area ───────────────────────────────────
+            _prog_bar = st.progress(_init_frac, text=_init_text)
+            _lm1, _lm2, _lm3, _lm4 = st.columns(4)
+            _ep_ph   = _lm1.empty()
+            _rw_ph   = _lm2.empty()
+            _eps_ph  = _lm3.empty()
+            _ela_ph  = _lm4.empty()
+            _cur_ph  = st.empty() if _curriculum_active else None
+
+            # ── Restore live metrics immediately on resume reruns ────
+            if _ep_restored > 0:
+                _rews_peek = _saved_state_peek.get("rewards") or []
+                _avg_r_peek = float(
+                    sum(_rews_peek[-20:]) / max(1, len(_rews_peek[-20:]))
+                ) if _rews_peek else 0.0
+                _eps_peek = float(
+                    _saved_state_peek.get("epsilon",
+                    _saved_state_peek.get("dqn_epsilon", 0.0))
+                )
+                _elapsed_peek = time.time() - _saved_tr_peek.get("started_at", time.time())
+                _eta_peek = (
+                    (_elapsed_peek / _ep_restored) * max(0, _total_ep - _ep_restored)
+                ) if _ep_restored > 0 else 0.0
+                _ep_ph.metric("Episode", f"{_ep_restored:,}", f"/ {_total_ep:,}")
+                _rw_ph.metric("Avg Reward", f"{_avg_r_peek:+.3f}")
+                _eps_ph.metric("Epsilon", f"{_eps_peek:.3f}")
+                _ela_ph.metric(
+                    "Elapsed / ETA",
+                    f"{int(_elapsed_peek)}s",
+                    f"≈{int(_eta_peek)}s left" if _eta_peek > 0 else None,
+                )
+            # ── Stop button lives here so it's always visible ────────
+            st.divider()
+            if st.button(
+                "⏹ Stop Training",
+                key="stop_training_btn_main",
+                use_container_width=True,
+                type="primary",
+                help="Stop now and show results collected so far",
+            ):
+                st.session_state["stop_training_requested"] = True
+                st.rerun()
+
+    env = GridWorld(grid_cfg)
+    # If step-through mode requested, initialise controller and don't run full training
+    if run_mode == "Step-through":
+        sr = st.session_state.setdefault("step_run", {})
+        sr["algo"] = algo
+        sr["cfg"] = algo_cfg
+        sr["env"] = env
+        sr.setdefault("state", None)
+        sr.setdefault("finished", False)
+        _train_status.update(label="⏸ Step-through mode ready — use the controls below", state="complete")
+        _safe_rerun()
+
+    if algo == "Policy Iteration":
+        _prog_bar.progress(0.3, text="Running Policy Iteration…")
+        pol, vals, hist = policy_iteration(env, algo_cfg)
+        st.session_state.results = dict(
+            algo=algo, env=env, policy=pol, values=vals,
+            rewards=None, lengths=None, pi_iters=len(hist),
+        )
+        _prog_bar.progress(1.0, text=f"Complete — {len(hist)} iterations")
+    else:
+        # Resumable full training loop stored in session_state['train_run']
+        if not isinstance(st.session_state.get("train_run"), dict):
+            st.session_state.train_run = {}
+        tr = st.session_state.train_run
+        tr.setdefault("algo", algo)
+        tr.setdefault("cfg", algo_cfg)
+        tr.setdefault("env", env)
+        tr.setdefault("state", None)
+        tr.setdefault("finished", False)
+        tr.setdefault("last_update", 0.0)
+        tr.setdefault("started_at", time.time())
+
+        cfg = tr["cfg"]
+        env = tr["env"]
+
+        # ── Potential-based shaping setup ─────────────────────────────────
+        _use_shaping = bool(st.session_state.get("use_potential_shaping", True))
+        # α = goal_reward / (rows + cols)  — precomputed once for the main env
+        _shaping_alpha = 1.0 / max(1, env.rows + env.cols)
+        # BFS distances from goal on the main env (used for Q-Learning / SARSA)
+        # Stored in tr so they survive batch reruns without recomputation.
+        if _use_shaping and "shaping_dist" not in tr:
+            tr["shaping_dist"] = _bfs_goal_distances(env)
+        _shaping_dist = tr.get("shaping_dist") or []
+
+        # Initialize per-algo state if needed
+        state = tr.get("state") or {}
+        if state == {}:
+            if algo == "Q-Learning" or algo == "SARSA":
+                state["Q"] = np.zeros((env.n_states, env.n_actions), dtype=np.float64)
+                state["epsilon"] = cfg.epsilon
+                state["episode"] = 0
+                state["rewards"] = []
+                state["lengths"] = []
+                state["episode_times"] = []
+                state["off_policy_steps"] = []
+                state["epsilon_values"] = []
+                state["episode_traces"] = []
+                state["episode_traces_all"] = []
+                state["visits"] = np.zeros(env.n_states, dtype=int)
+            elif algo == "DQN":
+                _n_nb = int(st.session_state.get("obs_n_neighbors", 0))
+                _use_gd = bool(st.session_state.get("obs_use_goal_dist", False))
+                _inp_dim = _obs_dim(env, _n_nb, _use_gd)
+
+                # ── Curriculum dimension check ────────────────────
+                # The curriculum setups must have been created with the
+                # same grid size as the current env; if not, the
+                # observation vectors are a different length and the
+                # forward/backward pass will silently produce wrong
+                # shapes (or crash).  Catch this before building the
+                # network.
+                _cur_setups_check = st.session_state.get("curriculum_setups") or []
+                if _cur_setups_check and st.session_state.get("use_curriculum"):
+                    _chk = _cur_setups_check[0]
+                    if _chk["rows"] != env.rows or _chk["cols"] != env.cols:
+                        st.error(
+                            f"⚠️ Curriculum setup grid size "
+                            f"({_chk['rows']}×{_chk['cols']}) doesn't match "
+                            f"the current grid ({env.rows}×{env.cols}).  "
+                            "Please click **Create Setups** again to regenerate "
+                            "them for the current grid size."
+                        )
+                        st.stop()
+
+                device = torch.device("cpu")
+                q_net = QNetwork(_inp_dim, env.n_actions, cfg.dqn_hidden).to(device)
+                target_net = QNetwork(_inp_dim, env.n_actions, cfg.dqn_hidden).to(device)
+                target_net.load_state_dict(q_net.state_dict())
+                target_net.eval()
+                optimizer = optim.Adam(q_net.parameters(), lr=cfg.dqn_lr)
+                buffer = ReplayBuffer(cfg.dqn_buffer_size)
+                state.update({
+                    "q_net": q_net,
+                    "target_net": target_net,
+                    "optimizer": optimizer,
+                    "buffer": buffer,
+                    "epsilon": cfg.dqn_epsilon,
+                    "total_steps": 0,
+                    "episodes": 0,
+                    "rewards": [],
+                    "lengths": [],
+                    "episode_times": [],
+                    "off_policy_steps": [],
+                    "epsilon_values": [],
+                    "episode_traces": [],
+                    "episode_traces_all": [],
+                    "visits": np.zeros(env.n_states, dtype=int),
+                    "obs_n_neighbors": _n_nb,
+                    "obs_use_goal_dist": _use_gd,
+                    "adr_difficulty": 0.0,
+                    "curriculum_stage": 0,
+                    "episode_complexities": [],
+                })
+                # Pre-build all curriculum environments ONCE so we never call
+                # _setup_to_env() (and its _build_transition_table()) per episode.
+                _cs_init = st.session_state.get("curriculum_setups") or []
+                state["_curric_envs"] = [_setup_to_env(s) for s in _cs_init]
+            tr["state"] = state
+
+        now = time.time()
+
+        # Run episodes until we need to update UI or finish
+        update_interval = 5.0
+        start_time = time.time()
+        # loop and perform episodes
+        while True:
+            if tr.get("finished"):
+                break
+            episode_start_time = time.time()
+            if algo == "Q-Learning":
+                Q = state["Q"]
+                eps = state["epsilon"]
+
+                # one episode
+                if getattr(cfg, "exploring_starts", False):
+                    valid_states = [s for s in range(env.n_states) if not env.is_wall(s) and not env.is_terminal(s)]
+                    s = int(random.choice(valid_states))
+                    env.agent_pos = divmod(s, env.cols)
+                    env.done = False
+                else:
+                    s = env.reset()
+                episode_trace = {
+                    "states": [s],
+                    "actions": [],
+                    "rewards": [],
+                    "next_states": [],
+                    "off_policy_steps": 0,
+                    "grid": env.grid.tolist(),
+                    "complexity": 0.0,
+                }
+                off_steps = 0
+                total_reward = 0.0
+                steps = 0
+                for _ in range(cfg.max_steps):
+                    state["visits"][s] += 1
+                    valid = valid_actions(env, s)
+                    if np.random.random() < eps:
+                        a = int(random.choice(valid))
+                        off_steps += 1
                     else:
-                        s = env.reset()
-                    episode_trace = {
-                        "states": [s],
-                        "actions": [],
-                        "rewards": [],
-                        "next_states": [],
-                        "off_policy_steps": 0,
-                    }
-                    off_steps = 0
-                    total_reward = 0.0
-                    steps = 0
-                    for _ in range(cfg.max_steps):
-                        state["visits"][s] += 1
-                        valid = valid_actions(env, s)
-                        if np.random.random() < eps:
-                            a = int(random.choice(valid))
-                            off_steps += 1
-                        else:
-                            a = int(max(valid, key=lambda act: Q[s, act])) if valid else int(np.argmax(Q[s]))
-                        ns, r, done = env.step(a)
-                        state["visits"][ns] += 1
-                        episode_trace["actions"].append(a)
-                        episode_trace["rewards"].append(r)
-                        episode_trace["next_states"].append(ns)
-                        episode_trace["states"].append(ns)
-                        # Accumulate discounted return: use env.gamma^t * r_t
-                        total_reward += (env.gamma ** steps) * r
-                        steps += 1
-                        best_next = 0.0 if done else float(np.max(Q[ns]))
-                        Q[s, a] += cfg.alpha * (r + env.gamma * best_next - Q[s, a])
-                        s = ns
-                        if done:
-                            break
-
-                    eps = max(cfg.epsilon_min, eps * cfg.epsilon_decay)
-                    state["epsilon"] = eps
-                    state["episode"] += 1
-                    state["rewards"].append(total_reward)
-                    state["lengths"].append(steps)
-                    state["episode_times"].append(time.time() - episode_start_time)
-                    state["off_policy_steps"].append(off_steps)
-                    state["epsilon_values"].append(eps)
-                    episode_trace["off_policy_steps"] = off_steps
-                    if st.session_state.get("record_episodes", False):
-                        state["episode_traces_all"].append(episode_trace)
-                        limit = st.session_state.get("record_limit", 100)
-                        if st.session_state.get("record_strategy", "Most recent") == "Subsample evenly":
-                            state["episode_traces"] = _evenly_subsample_traces(state["episode_traces_all"], limit)
-                        else:
-                            state["episode_traces"] = state["episode_traces_all"][-limit:]
-
-                    policy = np.argmax(Q, axis=1)
-                    st.session_state.results = dict(
-                        algo=algo, env=env, policy=policy, values=Q.max(axis=1),
-                        rewards=state["rewards"], lengths=state["lengths"], visits=state.get("visits"),
-                        episode_times=state.get("episode_times"), off_policy_steps=state.get("off_policy_steps"), 
-                        epsilon_values=state.get("epsilon_values"), episode_traces=state.get("episode_traces"),
+                        a = int(max(valid, key=lambda act: Q[s, act])) if valid else int(np.argmax(Q[s]))
+                    ns, r, done = env.step(a)
+                    state["visits"][ns] += 1
+                    episode_trace["actions"].append(a)
+                    episode_trace["rewards"].append(r)
+                    episode_trace["next_states"].append(ns)
+                    episode_trace["states"].append(ns)
+                    # Potential-based shaping (added to TD target only, not logged)
+                    _r_shaped = r + (
+                        _potential_shaping(s, ns, _shaping_dist, env.gamma, _shaping_alpha)
+                        if _use_shaping and _shaping_dist else 0.0
                     )
+                    # Accumulate discounted return: use env.gamma^t * r_t
+                    total_reward += (env.gamma ** steps) * r
+                    steps += 1
+                    best_next = 0.0 if done else float(np.max(Q[ns]))
+                    Q[s, a] += cfg.alpha * (_r_shaped + env.gamma * best_next - Q[s, a])
+                    s = ns
+                    if done:
+                        break
 
-                elif algo == "SARSA":
-                    Q = state["Q"]
-                    eps = state["epsilon"]
-
-                    def eps_greedy(s_):
-                        # Return (action, was_random). For terminal states, return dummy action.
-                        if env.is_terminal(s_):
-                            return 0, False
-                        valid = valid_actions(env, s_)
-                        if np.random.random() < eps:
-                            return int(random.choice(valid)), True
-                        if valid:
-                            return int(max(valid, key=lambda act: Q[s_, act])), False
-                        return int(np.argmax(Q[s_])), False
-
-                    if getattr(cfg, "exploring_starts", False):
-                        valid_states = [s for s in range(env.n_states) if not env.is_wall(s) and not env.is_terminal(s)]
-                        s = int(random.choice(valid_states))
-                        env.agent_pos = divmod(s, env.cols)
-                        env.done = False
+                eps = max(cfg.epsilon_min, eps * cfg.epsilon_decay)
+                state["epsilon"] = eps
+                state["episode"] += 1
+                state["rewards"].append(total_reward)
+                state["lengths"].append(steps)
+                state["episode_times"].append(time.time() - episode_start_time)
+                state["off_policy_steps"].append(off_steps)
+                state["epsilon_values"].append(eps)
+                episode_trace["off_policy_steps"] = off_steps
+                if st.session_state.get("record_episodes", False):
+                    state["episode_traces_all"].append(episode_trace)
+                    limit = st.session_state.get("record_limit", 100)
+                    if st.session_state.get("record_strategy", "Most recent") == "Subsample evenly":
+                        state["episode_traces"] = _evenly_subsample_traces(state["episode_traces_all"], limit)
                     else:
-                        s = env.reset()
-                    episode_trace = {
-                        "states": [s],
-                        "actions": [],
-                        "rewards": [],
-                        "next_states": [],
-                        "off_policy_steps": 0,
-                    }
-                    a, off = eps_greedy(s)
-                    total_reward = 0.0
-                    steps = 0
-                    off_steps = 1 if off else 0
-                    for _ in range(cfg.max_steps):
-                        state["visits"][s] += 1
-                        ns, r, done = env.step(a)
-                        state["visits"][ns] += 1
-                        episode_trace["actions"].append(a)
-                        episode_trace["rewards"].append(r)
-                        episode_trace["next_states"].append(ns)
-                        episode_trace["states"].append(ns)
-                        na, next_off = eps_greedy(ns)
-                        total_reward += (env.gamma ** steps) * r
-                        steps += 1
-                        off_steps += 1 if next_off else 0
-                        next_q = 0.0 if done else Q[ns, na]
-                        Q[s, a] += cfg.alpha * (r + env.gamma * next_q - Q[s, a])
-                        s, a = ns, na
-                        if done:
-                            break
+                        state["episode_traces"] = state["episode_traces_all"][-limit:]
 
-                    eps = max(cfg.epsilon_min, eps * cfg.epsilon_decay)
-                    state["epsilon"] = eps
-                    state["episode"] += 1
-                    state["rewards"].append(total_reward)
-                    state["lengths"].append(steps)
-                    state["episode_times"].append(time.time() - episode_start_time)
-                    state["off_policy_steps"].append(off_steps)
-                    state["epsilon_values"].append(eps)
-                    episode_trace["off_policy_steps"] = off_steps
-                    if st.session_state.get("record_episodes", False):
-                        state["episode_traces_all"].append(episode_trace)
-                        limit = st.session_state.get("record_limit", 100)
-                        if st.session_state.get("record_strategy", "Most recent") == "Subsample evenly":
-                            state["episode_traces"] = _evenly_subsample_traces(state["episode_traces_all"], limit)
-                        else:
-                            state["episode_traces"] = state["episode_traces_all"][-limit:]
+                policy = np.argmax(Q, axis=1)
+                st.session_state.results = dict(
+                    algo=algo, env=env, policy=policy, values=Q.max(axis=1),
+                    rewards=state["rewards"], lengths=state["lengths"], visits=state.get("visits"),
+                    episode_times=state.get("episode_times"), off_policy_steps=state.get("off_policy_steps"),
+                    epsilon_values=state.get("epsilon_values"), episode_traces=state.get("episode_traces"),
+                    episode_complexities=list(state.get("episode_complexities") or []),
+                )
 
-                    policy = np.argmax(Q, axis=1)
-                    st.session_state.results = dict(
-                        algo=algo, env=env, policy=policy, values=Q.max(axis=1),
-                        rewards=state["rewards"], lengths=state["lengths"], visits=state.get("visits"),
-                        episode_times=state.get("episode_times"), off_policy_steps=state.get("off_policy_steps"), 
-                        epsilon_values=state.get("epsilon_values"), episode_traces=state.get("episode_traces"),
+            elif algo == "SARSA":
+                Q = state["Q"]
+                eps = state["epsilon"]
+
+                def eps_greedy(s_):
+                    # Return (action, was_random). For terminal states, return dummy action.
+                    if env.is_terminal(s_):
+                        return 0, False
+                    valid = valid_actions(env, s_)
+                    if np.random.random() < eps:
+                        return int(random.choice(valid)), True
+                    if valid:
+                        return int(max(valid, key=lambda act: Q[s_, act])), False
+                    return int(np.argmax(Q[s_])), False
+
+                if getattr(cfg, "exploring_starts", False):
+                    valid_states = [s for s in range(env.n_states) if not env.is_wall(s) and not env.is_terminal(s)]
+                    s = int(random.choice(valid_states))
+                    env.agent_pos = divmod(s, env.cols)
+                    env.done = False
+                else:
+                    s = env.reset()
+                episode_trace = {
+                    "states": [s],
+                    "actions": [],
+                    "rewards": [],
+                    "next_states": [],
+                    "off_policy_steps": 0,
+                    "grid": env.grid.tolist(),
+                    "complexity": 0.0,
+                }
+                a, off = eps_greedy(s)
+                total_reward = 0.0
+                steps = 0
+                off_steps = 1 if off else 0
+                for _ in range(cfg.max_steps):
+                    state["visits"][s] += 1
+                    ns, r, done = env.step(a)
+                    state["visits"][ns] += 1
+                    episode_trace["actions"].append(a)
+                    episode_trace["rewards"].append(r)
+                    episode_trace["next_states"].append(ns)
+                    episode_trace["states"].append(ns)
+                    na, next_off = eps_greedy(ns)
+                    _r_shaped = r + (
+                        _potential_shaping(s, ns, _shaping_dist, env.gamma, _shaping_alpha)
+                        if _use_shaping and _shaping_dist else 0.0
                     )
+                    total_reward += (env.gamma ** steps) * r
+                    steps += 1
+                    off_steps += 1 if next_off else 0
+                    next_q = 0.0 if done else Q[ns, na]
+                    Q[s, a] += cfg.alpha * (_r_shaped + env.gamma * next_q - Q[s, a])
+                    s, a = ns, na
+                    if done:
+                        break
 
-                elif algo == "DQN":
-                    q_net = state["q_net"]
-                    target_net = state["target_net"]
-                    optimizer = state["optimizer"]
-                    buffer = state["buffer"]
-                    eps = state["epsilon"]
-                    total_steps = state.get("total_steps", 0)
-
-                    def state_vec(s):
-                        v = [0.0] * env.n_states
-                        v[s] = 1.0
-                        return v
-
-                    if getattr(cfg, "exploring_starts", False):
-                        valid_states = [s for s in range(env.n_states) if not env.is_wall(s) and not env.is_terminal(s)]
-                        s = int(random.choice(valid_states))
-                        env.agent_pos = divmod(s, env.cols)
-                        env.done = False
+                eps = max(cfg.epsilon_min, eps * cfg.epsilon_decay)
+                state["epsilon"] = eps
+                state["episode"] += 1
+                state["rewards"].append(total_reward)
+                state["lengths"].append(steps)
+                state["episode_times"].append(time.time() - episode_start_time)
+                state["off_policy_steps"].append(off_steps)
+                state["epsilon_values"].append(eps)
+                episode_trace["off_policy_steps"] = off_steps
+                if st.session_state.get("record_episodes", False):
+                    state["episode_traces_all"].append(episode_trace)
+                    limit = st.session_state.get("record_limit", 100)
+                    if st.session_state.get("record_strategy", "Most recent") == "Subsample evenly":
+                        state["episode_traces"] = _evenly_subsample_traces(state["episode_traces_all"], limit)
                     else:
-                        s = env.reset()
-                    episode_trace = {
-                        "states": [s],
-                        "actions": [],
-                        "rewards": [],
-                        "next_states": [],
-                        "off_policy_steps": 0,
-                    }
-                    sv = state_vec(s)
-                    total_rew = 0.0
-                    steps = 0
-                    off_steps = 0
+                        state["episode_traces"] = state["episode_traces_all"][-limit:]
 
-                    for _ in range(cfg.max_steps):
-                        state["visits"][s] += 1
-                        valid = valid_actions(env, s)
-                        if random.random() < eps:
-                            action = int(random.choice(valid))
-                            off_steps += 1
-                        else:
-                            with torch.no_grad():
-                                s_t = torch.tensor([sv], dtype=torch.float32)
-                                q_values = q_net(s_t).squeeze(0)
-                                if valid:
-                                    action = int(max(valid, key=lambda act: float(q_values[act])))
-                                else:
-                                    action = int(q_values.argmax().item())
+                policy = np.argmax(Q, axis=1)
+                st.session_state.results = dict(
+                    algo=algo, env=env, policy=policy, values=Q.max(axis=1),
+                    rewards=state["rewards"], lengths=state["lengths"], visits=state.get("visits"),
+                    episode_times=state.get("episode_times"), off_policy_steps=state.get("off_policy_steps"),
+                    epsilon_values=state.get("epsilon_values"), episode_traces=state.get("episode_traces"),
+                    episode_complexities=list(state.get("episode_complexities") or []),
+                )
 
-                        ns, r, done = env.step(action)
-                        state["visits"][ns] += 1
-                        episode_trace["actions"].append(action)
-                        episode_trace["rewards"].append(r)
-                        episode_trace["next_states"].append(ns)
-                        episode_trace["states"].append(ns)
-                        next_sv = state_vec(ns)
-                        total_rew += (env.gamma ** steps) * r
-                        steps += 1
-                        total_steps += 1
+            elif algo == "DQN":
+                q_net = state["q_net"]
+                target_net = state["target_net"]
+                optimizer = state["optimizer"]
+                buffer = state["buffer"]
+                eps = state["epsilon"]
+                total_steps = state.get("total_steps", 0)
+                _n_nb = state.get("obs_n_neighbors", 0)
+                _use_gd = state.get("obs_use_goal_dist", False)
 
-                        buffer.push(sv, action, r, next_sv, 1.0 if done else 0.0)
-                        s = ns
-                        sv = next_sv
+                # ── Curriculum: pick episode environment ──────────
+                _use_curric = st.session_state.get("use_curriculum", False)
+                _curric_setups = st.session_state.get("curriculum_setups") or []
+                _curric_method = st.session_state.get("curriculum_method", "ADR")
+                _curric_thr = float(st.session_state.get("curriculum_perf_threshold", 0.5))
 
-                        if len(buffer) >= cfg.dqn_batch_size:
-                            s_b, a_b, r_b, ns_b, d_b = buffer.sample(cfg.dqn_batch_size)
-                            s_t = torch.tensor(s_b, dtype=torch.float32)
-                            a_t = torch.tensor(a_b, dtype=torch.long)
-                            r_t = torch.tensor(r_b, dtype=torch.float32)
-                            ns_t = torch.tensor(ns_b, dtype=torch.float32)
-                            d_t = torch.tensor(d_b, dtype=torch.float32)
+                # Use the pre-cached env list (built once at init) to avoid
+                # rebuilding GridWorld + transition table every episode.
+                _curric_envs = state.get("_curric_envs", [])
 
-                            current_q = q_net(s_t).gather(1, a_t.unsqueeze(1)).squeeze(1)
-                            with torch.no_grad():
-                                max_next_q = target_net(ns_t).max(dim=1)[0]
-                                target_q = r_t + env.gamma * max_next_q * (1.0 - d_t)
+                if _use_curric and _curric_setups and _curric_envs:
+                    if _curric_method == "ADR":
+                        _adr_diff = state.get("adr_difficulty", 0.0)
+                        _tgt = int(_adr_diff * (len(_curric_setups) - 1))
+                        # Spread: ±5% of the setup list around the target index
+                        _spread = max(1, len(_curric_setups) // 20)
+                        _ep_idx = max(0, min(len(_curric_setups) - 1,
+                                              _tgt + random.randint(-_spread, _spread)))
+                        episode_env = _curric_envs[_ep_idx]
+                        if len(state["rewards"]) >= 20:
+                            _avg_r = float(np.mean(state["rewards"][-20:]))
+                            # Advance rate: reach full difficulty in roughly 50% of
+                            # total episodes when consistently above threshold.
+                            _adr_step = max(0.002, 2.0 / max(1, cfg.dqn_n_episodes))
+                            if _avg_r > _curric_thr:
+                                state["adr_difficulty"] = min(1.0, _adr_diff + _adr_step)
+                            elif _avg_r < _curric_thr * 0.3:
+                                state["adr_difficulty"] = max(0.0, _adr_diff - _adr_step / 2)
+                    else:  # Performance Threshold
+                        _n_stages = min(10, len(_curric_setups))
+                        _stage = state.get("curriculum_stage", 0)
+                        _per_stage = max(1, len(_curric_setups) // _n_stages)
+                        _s_start = _stage * _per_stage
+                        _s_end = min(len(_curric_setups), _s_start + _per_stage)
+                        _ep_idx = random.randint(_s_start, _s_end - 1)
+                        episode_env = _curric_envs[_ep_idx]
+                        if len(state["rewards"]) >= 20:
+                            _avg_r = float(np.mean(state["rewards"][-20:]))
+                            if _avg_r > _curric_thr and _stage < _n_stages - 1:
+                                state["curriculum_stage"] = _stage + 1
+                    # Record this episode's complexity (1–10 scale) for live display
+                    _this_ep_complexity = float(_curric_setups[_ep_idx].get("complexity", 0.0))
+                    state.setdefault("episode_complexities", []).append(_this_ep_complexity)
+                else:
+                    episode_env = env
+                    _this_ep_complexity = 0.0
 
-                            loss = nn.functional.mse_loss(current_q, target_q)
+                def state_vec(s, _e=episode_env):
+                    return _build_obs(_e, s, _n_nb, _use_gd)
+
+                # BFS distances for this episode's env (curriculum may use different grids)
+                _ep_shaping_dist = (
+                    _bfs_goal_distances(episode_env) if _use_shaping else []
+                )
+                _ep_shaping_alpha = 1.0 / max(1, episode_env.rows + episode_env.cols)
+
+                if getattr(cfg, "exploring_starts", False):
+                    valid_states = [s for s in range(episode_env.n_states)
+                                    if not episode_env.is_wall(s) and not episode_env.is_terminal(s)]
+                    s = int(random.choice(valid_states))
+                    episode_env.agent_pos = divmod(s, episode_env.cols)
+                    episode_env.done = False
+                else:
+                    s = episode_env.reset()
+                episode_trace = {
+                    "states": [s],
+                    "actions": [],
+                    "rewards": [],
+                    "next_states": [],
+                    "off_policy_steps": 0,
+                    "grid": episode_env.grid.tolist(),
+                    "complexity": _this_ep_complexity,
+                }
+                sv = state_vec(s)
+                total_rew = 0.0
+                steps = 0
+                off_steps = 0
+
+                for _ in range(cfg.max_steps):
+                    state["visits"][s] += 1
+                    valid = valid_actions(episode_env, s)
+                    if random.random() < eps:
+                        action = int(random.choice(valid))
+                        off_steps += 1
+                    else:
+                        with torch.no_grad():
+                            s_t = torch.tensor([sv], dtype=torch.float32)
+                            q_values = q_net(s_t).squeeze(0)
+                            if valid:
+                                action = int(max(valid, key=lambda act: float(q_values[act])))
+                            else:
+                                action = int(q_values.argmax().item())
+
+                    ns, r, done = episode_env.step(action)
+                    state["visits"][ns] += 1
+                    episode_trace["actions"].append(action)
+                    episode_trace["rewards"].append(r)
+                    episode_trace["next_states"].append(ns)
+                    episode_trace["states"].append(ns)
+                    next_sv = state_vec(ns)
+                    _r_shaped = r + (
+                        _potential_shaping(s, ns, _ep_shaping_dist, episode_env.gamma, _ep_shaping_alpha)
+                        if _use_shaping and _ep_shaping_dist else 0.0
+                    )
+                    total_rew += (episode_env.gamma ** steps) * r
+                    steps += 1
+                    total_steps += 1
+
+                    buffer.push(sv, action, float(np.clip(_r_shaped, -10.0, 10.0)), next_sv, 1.0 if done else 0.0)
+                    s = ns
+                    sv = next_sv
+
+                    if len(buffer) >= cfg.dqn_batch_size:
+                        s_b, a_b, r_b, ns_b, d_b = buffer.sample(cfg.dqn_batch_size)
+                        s_t = torch.tensor(s_b, dtype=torch.float32)
+                        a_t = torch.tensor(a_b, dtype=torch.long)
+                        r_t = torch.tensor(r_b, dtype=torch.float32)
+                        ns_t = torch.tensor(ns_b, dtype=torch.float32)
+                        d_t = torch.tensor(d_b, dtype=torch.float32)
+
+                        current_q = q_net(s_t).gather(1, a_t.unsqueeze(1)).squeeze(1)
+                        with torch.no_grad():
+                            max_next_q = target_net(ns_t).max(dim=1)[0]
+                            target_q = r_t + episode_env.gamma * max_next_q * (1.0 - d_t)
+
+                        loss = nn.functional.mse_loss(current_q, target_q)
+                        if not torch.isnan(loss) and not torch.isinf(loss):
                             optimizer.zero_grad()
                             loss.backward()
+                            torch.nn.utils.clip_grad_norm_(q_net.parameters(), max_norm=10.0)
                             optimizer.step()
 
-                        if total_steps % cfg.dqn_target_update == 0:
-                            target_net.load_state_dict(q_net.state_dict())
+                    if total_steps % cfg.dqn_target_update == 0:
+                        target_net.load_state_dict(q_net.state_dict())
 
-                        if done:
-                            break
+                    if done:
+                        break
 
-                    eps = max(cfg.dqn_epsilon_min, eps * cfg.dqn_epsilon_decay)
-                    state["epsilon"] = eps
-                    state["total_steps"] = total_steps
-                    state["episodes"] += 1
-                    state["rewards"].append(total_rew)
-                    state["lengths"].append(steps)
-                    state["episode_times"].append(time.time() - episode_start_time)
-                    state["off_policy_steps"].append(off_steps)
-                    state["epsilon_values"].append(eps)
-                    episode_trace["off_policy_steps"] = off_steps
-                    if st.session_state.get("record_episodes", False):
-                        state["episode_traces_all"].append(episode_trace)
-                        limit = st.session_state.get("record_limit", 100)
-                        if st.session_state.get("record_strategy", "Most recent") == "Subsample evenly":
-                            state["episode_traces"] = _evenly_subsample_traces(state["episode_traces_all"], limit)
-                        else:
-                            state["episode_traces"] = state["episode_traces_all"][-limit:]
+                eps = max(cfg.dqn_epsilon_min, eps * cfg.dqn_epsilon_decay)
+                state["epsilon"] = eps
+                state["total_steps"] = total_steps
+                state["episodes"] += 1
+                state["rewards"].append(total_rew)
+                state["lengths"].append(steps)
+                state["episode_times"].append(time.time() - episode_start_time)
+                state["off_policy_steps"].append(off_steps)
+                state["epsilon_values"].append(eps)
+                episode_trace["off_policy_steps"] = off_steps
+                if st.session_state.get("record_episodes", False):
+                    state["episode_traces_all"].append(episode_trace)
+                    limit = st.session_state.get("record_limit", 100)
+                    if st.session_state.get("record_strategy", "Most recent") == "Subsample evenly":
+                        state["episode_traces"] = _evenly_subsample_traces(state["episode_traces_all"], limit)
+                    else:
+                        state["episode_traces"] = state["episode_traces_all"][-limit:]
 
-                    # Extract Q-table
-                    all_states = [[1.0 if i == s else 0.0 for i in range(env.n_states)] for s in range(env.n_states)]
-                    with torch.no_grad():
-                        Q_list = q_net(torch.tensor(all_states, dtype=torch.float32)).tolist()
-                    Q_table = np.array(Q_list, dtype=np.float64)
-                    policy = np.argmax(Q_table, axis=1)
-                    st.session_state.results = dict(
-                        algo=algo, env=env, policy=policy, values=Q_table.max(axis=1),
-                        rewards=state["rewards"], lengths=state["lengths"], visits=state.get("visits"),
-                        episode_times=state.get("episode_times"), off_policy_steps=state.get("off_policy_steps"), 
-                        epsilon_values=state.get("epsilon_values"), episode_traces=state.get("episode_traces"),
-                    )
+                # Extract Q-table against main env for visualisation
+                all_obs = [_build_obs(env, _si, _n_nb, _use_gd) for _si in range(env.n_states)]
+                with torch.no_grad():
+                    Q_list = q_net(torch.tensor(all_obs, dtype=torch.float32)).tolist()
+                Q_table = np.array(Q_list, dtype=np.float64)
+                policy = np.argmax(Q_table, axis=1)
+                st.session_state.results = dict(
+                    algo=algo, env=env, policy=policy, values=Q_table.max(axis=1),
+                    rewards=state["rewards"], lengths=state["lengths"], visits=state.get("visits"),
+                    episode_times=state.get("episode_times"), off_policy_steps=state.get("off_policy_steps"),
+                    epsilon_values=state.get("epsilon_values"), episode_traces=state.get("episode_traces"),
+                    episode_complexities=list(state.get("episode_complexities") or []),
+                    # Saved for post-training testing
+                    q_net=q_net, obs_n_neighbors=_n_nb, obs_use_goal_dist=_use_gd,
+                )
 
-                # persist state
-                tr["state"] = state
+            # persist state
+            tr["state"] = state
 
-                # Check for UI update interval
-                now = time.time()
-                if now - tr.get("last_update", 0.0) >= update_interval:
-                    tr["last_update"] = now
-                    st.session_state.train_run = tr
-                    _safe_rerun()
-
-                # exit if finished
-                if (algo == "DQN" and len(state.get("rewards", [])) >= cfg.dqn_n_episodes) or \
-                   (algo in ("Q-Learning", "SARSA") and len(state.get("rewards", [])) >= cfg.n_episodes):
-                    tr["finished"] = True
-                    break
-
-            # If finished, set final results and clear train_run
-            if tr.get("finished"):
-                st.session_state.results = st.session_state.results or {}
-                # make sure final results are stored
+            # Check for UI update interval
+            now = time.time()
+            if now - tr.get("last_update", 0.0) >= update_interval:
+                tr["last_update"] = now
+                # ── Live progress update ─────────────────────────────
+                _ep_done  = len(state.get("rewards", []))
+                _frac     = min(1.0, _ep_done / max(1, _total_ep))
+                _avg_r    = float(np.mean(state["rewards"][-20:])) if state.get("rewards") else 0.0
+                _cur_eps  = float(state.get("epsilon", state.get("dqn_epsilon", 0.0)))
+                _elapsed  = now - tr.get("started_at", now)
+                _eta_s    = (_elapsed / max(1, _ep_done)) * max(0, _total_ep - _ep_done) if _ep_done > 0 else 0.0
+                _prog_bar.progress(_frac, text=f"Episode {_ep_done:,} / {_total_ep:,}")
+                _ep_ph.metric("Episode", f"{_ep_done:,}", f"/ {_total_ep:,}")
+                _rw_ph.metric("Avg Reward", f"{_avg_r:+.3f}")
+                _eps_ph.metric("Epsilon", f"{_cur_eps:.3f}")
+                _ela_ph.metric(
+                    "Elapsed / ETA",
+                    f"{int(_elapsed)}s",
+                    f"≈{int(_eta_s)}s left" if _eta_s > 0 else None,
+                )
+                if _cur_ph is not None:
+                    _ep_cx = state.get("episode_complexities", [])
+                    _avg_cx = float(np.mean(_ep_cx[-20:])) if _ep_cx else 0.0
+                    _prev_cx = float(np.mean(_ep_cx[-40:-20])) if len(_ep_cx) >= 40 else None
+                    _cx_delta = f"{_avg_cx - _prev_cx:+.2f}" if _prev_cx is not None else None
+                    if _method == "ADR":
+                        _cur_ph.metric(
+                            "Avg Complexity (20)",
+                            f"{_avg_cx:.2f} / 10",
+                            _cx_delta,
+                            help="Mean complexity of the last 20 curriculum episodes (1 = easiest, 10 = hardest). "
+                                 "Delta vs the previous 20-episode window.",
+                        )
+                    else:
+                        _cstage = state.get("curriculum_stage", 0)
+                        _cur_ph.metric(
+                            "Avg Complexity (20)",
+                            f"{_avg_cx:.2f} / 10",
+                            f"Stage {_cstage}/{min(10, _n_cur)}",
+                            help="Mean complexity of the last 20 curriculum episodes.",
+                        )
+                # ─────────────────────────────────────────────────────
+                # Save state and break out to let Streamlit process events
+                # (the st.rerun() at the end of this block will continue training)
                 st.session_state.train_run = tr
-                # cleanup controller
-                try:
-                    del st.session_state["train_run"]
-                except Exception:
-                    pass
+                break  # yield to Streamlit; next rerun picks up via _tr_resume
+
+            # exit if finished
+            if (algo == "DQN" and len(state.get("rewards", [])) >= cfg.dqn_n_episodes) or \
+               (algo in ("Q-Learning", "SARSA") and len(state.get("rewards", [])) >= cfg.n_episodes):
+                tr["finished"] = True
+                break
+
+        # If finished, set final results and clear train_run
+        if tr.get("finished"):
+            st.session_state.results = st.session_state.results or {}
+            # make sure final results are stored
+            st.session_state.train_run = tr
+            # cleanup controller
+            try:
+                del st.session_state["train_run"]
+            except Exception:
+                pass
+
+    # ── Finalise only when the run is actually done ───────────────────
+    if tr.get("finished"):
+        try:
+            _ep_done = len(
+                (st.session_state.results or {}).get("rewards") or []
+            )
+            _prog_bar.progress(1.0, text=f"Complete — {_ep_done:,} episodes")
+            _ep_ph.metric("Episode", f"{_ep_done:,}", f"/ {_total_ep:,}")
+            _elapsed_final = time.time() - (
+                st.session_state.get("train_run", {}).get("started_at", time.time())
+            )
+            _ela_ph.metric("Elapsed / ETA", f"{int(_elapsed_final)}s", "done ✓")
+            _train_status.update(label="✅ Training complete!", state="complete")
+        except Exception:
+            pass
+
+        # ── Auto-save run to results/ folder ──────────────────────────
+        try:
+            _saved_path = _auto_save_run(
+                st.session_state.get("training_summary", {}),
+                st.session_state.results or {},
+            )
+            if _saved_path:
+                st.session_state["last_saved_run_path"] = _saved_path
+        except Exception:
+            pass
 
     st.rerun()
