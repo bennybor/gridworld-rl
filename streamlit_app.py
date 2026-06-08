@@ -55,29 +55,70 @@ h1 { font-size: 1.8rem !important; font-weight: 700 !important;
     border-right: 1px solid #334155;
 }
 [data-testid="stSidebar"] * { color: #e2e8f0 !important; }
+
+/* Input / textarea / select — white bg, dark readable text */
 [data-testid="stSidebar"] input,
-[data-testid="stSidebar"] textarea {
+[data-testid="stSidebar"] textarea,
+[data-testid="stSidebar"] select {
     color: #0f172a !important;
-    background-color: #ffffff !important;
+    background-color: #f8fafc !important;
     caret-color: #0f172a !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 6px !important;
+    font-size: 0.82rem !important;
 }
-[data-testid="stSidebar"] .stSlider [data-baseweb="slider"] {
-    padding: 0 0.5rem;
+[data-testid="stSidebar"] input:focus,
+[data-testid="stSidebar"] textarea:focus {
+    border-color: #6366f1 !important;
+    box-shadow: 0 0 0 2px rgba(99,102,241,0.15) !important;
+    outline: none !important;
 }
-[data-testid="stSidebar"] hr { border-color: #334155; margin: 0.8rem 0; }
-[data-testid="stSidebar"] label { font-size: 0.8rem !important; color: #94a3b8 !important; }
+/* Selectbox dropdown text */
+[data-testid="stSidebar"] [data-baseweb="select"] span { color: #0f172a !important; }
+[data-testid="stSidebar"] [data-baseweb="select"] [data-baseweb="tag"] { background: #e0e7ff !important; }
+
+/* Compact widget spacing */
+[data-testid="stSidebar"] .stSlider [data-baseweb="slider"] { padding: 0 0.4rem; }
+[data-testid="stSidebar"] .stSlider,
+[data-testid="stSidebar"] .stNumberInput,
+[data-testid="stSidebar"] .stCheckbox,
+[data-testid="stSidebar"] .stSelectbox { margin-bottom: 0.15rem !important; }
+[data-testid="stSidebar"] .element-container { margin-bottom: 0.1rem !important; }
+
+/* Dividers */
+[data-testid="stSidebar"] hr { border-color: #334155; margin: 0.5rem 0; }
+
+/* Labels */
+[data-testid="stSidebar"] label {
+    font-size: 0.75rem !important;
+    color: #94a3b8 !important;
+    margin-bottom: 0.05rem !important;
+    line-height: 1.3 !important;
+}
+
+/* Section headings */
 [data-testid="stSidebar"] h3 {
-    font-size: 0.7rem !important; font-weight: 600 !important;
-    color: #6366f1 !important; letter-spacing: 0.08em;
-    text-transform: uppercase; margin: 0.6rem 0 0.3rem;
+    font-size: 0.68rem !important; font-weight: 700 !important;
+    color: #818cf8 !important; letter-spacing: 0.1em;
+    text-transform: uppercase; margin: 0.4rem 0 0.15rem;
 }
+
+/* Buttons */
 [data-testid="stSidebar"] .stButton > button {
     background: #1e293b; border: 1px solid #334155;
     color: #e2e8f0 !important; border-radius: 8px;
-    font-size: 0.8rem; padding: 0.3rem 0.6rem;
+    font-size: 0.78rem; padding: 0.25rem 0.5rem;
 }
 [data-testid="stSidebar"] .stButton > button:hover {
     background: #334155; border-color: #6366f1;
+}
+
+/* Caption / help text */
+[data-testid="stSidebar"] .stCaption,
+[data-testid="stSidebar"] small {
+    font-size: 0.7rem !important;
+    color: #64748b !important;
+    line-height: 1.3 !important;
 }
 
 /* Main area cards */
@@ -232,7 +273,7 @@ def _safe_rerun() -> None:
 _TRAINING_DEFAULTS: dict = {
     "algo": "Q-Learning",
     "run_mode": "Full",
-    "episodes": 3000,
+    "episodes": 1000,
     "alpha": 0.1,
     "epsilon": 1.0,
     "epsilon_decay": 0.998,
@@ -248,7 +289,7 @@ _TRAINING_DEFAULTS: dict = {
     "dqn_batch_size": 64,
     "dqn_buffer_size": 10_000,
     "dqn_target_update": 100,
-    "dqn_episodes": 3000,
+    "dqn_episodes": 1000,
     "dqn_epsilon": 1.0,
     "dqn_epsilon_decay": 0.997,
     "dqn_epsilon_min": 0.01,
@@ -1298,25 +1339,43 @@ def make_replay_fig(env, trace):
     else:
         _display_grid = env.grid
 
+    # Cell rewards: prefer trace-stored (accurate per episode), fall back to session state
+    _trace_cr_raw = trace.get("cell_rewards") or {}
+    _trace_cr = {
+        tuple(int(x) for x in k.split(",")): float(v)
+        for k, v in _trace_cr_raw.items()
+    } if _trace_cr_raw else st.session_state.get("cell_rewards", {})
+
+    # Start position stored in trace, or fall back to env
+    _trace_start = trace.get("start_pos")
+    _start_rc = tuple(_trace_start) if _trace_start is not None else getattr(env, "start_pos", None)
+
     for r in range(rows):
         for c in range(cols):
             t = int(_display_grid[r, c])
             y0 = rows - 1 - r
+
+            # Mark start cell (stored as EMPTY in grid; overlay a Start-style fill)
+            _is_start = _start_rc is not None and (r, c) == tuple(_start_rc)
+            fill = CELL_FILL[5] if _is_start else CELL_FILL[t]
+            border = CELL_LINE[5] if _is_start else CELL_LINE[t]
+
             fig.add_shape(
                 type="rect", layer="below",
                 x0=c + 0.05, y0=y0 + 0.05, x1=c + 0.95, y1=y0 + 0.95,
-                fillcolor=CELL_FILL[t],
-                line=dict(color=CELL_LINE[t], width=1.5),
+                fillcolor=fill,
+                line=dict(color=border, width=1.5),
             )
-            lbl = CELL_LBL[t]
+            lbl = CELL_LBL[5] if _is_start else CELL_LBL[t]
+            fg  = CELL_FG[5]  if _is_start else CELL_FG[t]
             if lbl:
                 fig.add_annotation(
                     x=c + 0.5, y=y0 + 0.5, text=f"<b>{lbl}</b>",
                     showarrow=False,
-                    font=dict(size=max(13, cell // 4), color=CELL_FG[t]),
+                    font=dict(size=max(13, cell // 4), color=fg),
                     xanchor="center", yanchor="middle",
                 )
-            cr = st.session_state.get("cell_rewards", {}).get((r, c), None)
+            cr = _trace_cr.get((r, c), None)
             if cr is not None:
                 badge_color = "#ECFDF5" if float(cr) >= 0 else "#FEF3F2"
                 badge_border = "#86EFAC" if float(cr) >= 0 else "#FCA5A5"
@@ -2560,14 +2619,14 @@ def _grid_thumbnail_html(layout, rows, cols, cell_rewards=None):
 
 # ── Session state defaults ────────────────────────────────────────────
 for _k, _v in {
-    "episodes": 3000,
+    "episodes": 1000,
     "alpha": 0.1,
     "dqn_hidden_str": "64,64",
     "dqn_lr": 1e-3,
     "dqn_batch_size": 64,
     "dqn_buffer_size": 10_000,
     "dqn_target_update": 100,
-    "dqn_episodes": 3000,
+    "dqn_episodes": 1000,
     "dqn_epsilon": 1.0,
     "dqn_epsilon_decay": 0.997,
     "dqn_epsilon_min": 0.01,
@@ -2874,7 +2933,7 @@ with st.sidebar:
 
         if algo != "Policy Iteration":
             st.markdown("### Hyperparameters")
-            episodes = st.number_input("Episodes", 200, 20_000, int(st.session_state.get("episodes", 3000)), 200, key="episodes")
+            episodes = st.number_input("Episodes", 200, 20_000, int(st.session_state.get("episodes", 1000)), 200, key="episodes")
             alpha = st.number_input("Learning rate α", 0.001, 1.0, float(st.session_state.get("alpha", 0.1)), 0.005,
                                     format="%.3f", key="alpha")
             epsilon = st.slider("Exploration ε", 0.0, 1.0, float(st.session_state.get("epsilon", 1.0)), 0.01,
@@ -2905,7 +2964,7 @@ with st.sidebar:
                 dqn_batch_size = st.number_input("DQN batch size", 8, 4096, int(st.session_state.get("dqn_batch_size", 64)), step=1, key="dqn_batch_size")
                 dqn_buffer_size = st.number_input("DQN buffer size", 100, 1_000_000, int(st.session_state.get("dqn_buffer_size", 10_000)), step=100, key="dqn_buffer_size")
                 dqn_target_update = st.number_input("DQN target update (steps)", 1, 100_000, int(st.session_state.get("dqn_target_update", 100)), step=1, key="dqn_target_update")
-                dqn_episodes = st.number_input("DQN episodes", 1, 50_000, int(st.session_state.get("dqn_episodes", 3000)), step=100, key="dqn_episodes")
+                dqn_episodes = st.number_input("DQN episodes", 1, 50_000, int(st.session_state.get("dqn_episodes", 1000)), step=100, key="dqn_episodes")
                 dqn_epsilon = st.number_input("DQN epsilon (initial)", 0.0, 1.0, float(st.session_state.get("dqn_epsilon", 1.0)), step=0.01, format="%.3f", key="dqn_epsilon")
                 dqn_epsilon_decay = st.number_input("DQN epsilon decay", 0.900, 1.000, float(st.session_state.get("dqn_epsilon_decay", 0.997)), step=0.0005, format="%.4f", key="dqn_epsilon_decay")
                 dqn_epsilon_min = st.number_input("DQN epsilon min", 0.0, 1.0, float(st.session_state.get("dqn_epsilon_min", 0.01)), step=0.01, format="%.3f", key="dqn_epsilon_min")
@@ -3537,8 +3596,8 @@ with right_col:
                     ),
                     AlgorithmConfig(
                         alpha=st.session_state.get("alpha", 0.1),
-                        n_episodes=st.session_state.get("episodes", 3000),
-                        dqn_n_episodes=st.session_state.get("episodes", 3000),
+                        n_episodes=st.session_state.get("episodes", 1000),
+                        dqn_n_episodes=st.session_state.get("episodes", 1000),
                         max_steps=st.session_state.get("max_steps", 200),
                         epsilon=st.session_state.get("epsilon", 1.0),
                         epsilon_decay=st.session_state.get("epsilon_decay", 0.998),
@@ -4427,11 +4486,17 @@ if train_clicked or _tr_resume:
             st.divider()
             # ── Live progress area ───────────────────────────────────
             _prog_bar = st.progress(_init_frac, text=_init_text)
-            _lm1, _lm2, _lm3, _lm4 = st.columns(4)
+            _is_dqn_run = (algo == "DQN")
+            if _is_dqn_run:
+                _lm1, _lm2, _lm3, _lm4, _lm5 = st.columns(5)
+            else:
+                _lm1, _lm2, _lm3, _lm4 = st.columns(4)
+                _lm5 = None
             _ep_ph   = _lm1.empty()
             _rw_ph   = _lm2.empty()
             _eps_ph  = _lm3.empty()
             _ela_ph  = _lm4.empty()
+            _buf_ph  = _lm5.empty() if _lm5 is not None else None
             _cur_ph  = st.empty() if _curriculum_active else None
 
             # ── Restore live metrics immediately on resume reruns ────
@@ -4456,6 +4521,16 @@ if train_clicked or _tr_resume:
                     f"{int(_elapsed_peek)}s",
                     f"≈{int(_eta_peek)}s left" if _eta_peek > 0 else None,
                 )
+                if _buf_ph is not None:
+                    _buf_peek = _saved_state_peek.get("buffer")
+                    _buf_len  = len(_buf_peek) if _buf_peek is not None else 0
+                    _buf_cap  = _saved_tr_peek.get("cfg") and _saved_tr_peek["cfg"].dqn_buffer_size or 1
+                    _buf_ph.metric(
+                        "Replay buffer",
+                        f"{_buf_len:,}",
+                        f"/ {_buf_cap:,}",
+                        help="Number of transitions stored in the DQN replay buffer.",
+                    )
             # ── Stop button lives here so it's always visible ────────
             st.divider()
             if st.button(
@@ -4618,6 +4693,8 @@ if train_clicked or _tr_resume:
                     "next_states": [],
                     "off_policy_steps": 0,
                     "grid": env.grid.tolist(),
+                    "cell_rewards": {f"{r},{c}": float(v) for (r, c), v in env.config.cell_rewards.items()},
+                    "start_pos": list(env.start_pos),
                     "complexity": 0.0,
                 }
                 off_steps = 0
@@ -4706,6 +4783,8 @@ if train_clicked or _tr_resume:
                     "next_states": [],
                     "off_policy_steps": 0,
                     "grid": env.grid.tolist(),
+                    "cell_rewards": {f"{r},{c}": float(v) for (r, c), v in env.config.cell_rewards.items()},
+                    "start_pos": list(env.start_pos),
                     "complexity": 0.0,
                 }
                 a, off = eps_greedy(s)
@@ -4841,6 +4920,8 @@ if train_clicked or _tr_resume:
                     "next_states": [],
                     "off_policy_steps": 0,
                     "grid": episode_env.grid.tolist(),
+                    "cell_rewards": {f"{r},{c}": float(v) for (r, c), v in episode_env.config.cell_rewards.items()},
+                    "start_pos": list(episode_env.start_pos),
                     "complexity": _this_ep_complexity,
                 }
                 sv = state_vec(s)
@@ -4965,6 +5046,16 @@ if train_clicked or _tr_resume:
                     f"{int(_elapsed)}s",
                     f"≈{int(_eta_s)}s left" if _eta_s > 0 else None,
                 )
+                if _buf_ph is not None:
+                    _live_buf = state.get("buffer")
+                    _live_buf_len = len(_live_buf) if _live_buf is not None else 0
+                    _live_buf_cap = cfg.dqn_buffer_size
+                    _buf_ph.metric(
+                        "Replay buffer",
+                        f"{_live_buf_len:,}",
+                        f"/ {_live_buf_cap:,}",
+                        help="Transitions in replay buffer. Training starts once ≥ batch size.",
+                    )
                 if _cur_ph is not None:
                     _ep_cx = state.get("episode_complexities", [])
                     _avg_cx = float(np.mean(_ep_cx[-20:])) if _ep_cx else 0.0
